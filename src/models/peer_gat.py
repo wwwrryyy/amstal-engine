@@ -44,7 +44,7 @@ class PeerGAT(nn.Module):
         except RuntimeError:
             pass
 
-        # Layer 1: GATConv 15 -> 32
+        # Layer 1: GATConv 10 -> 32 with explicit 1D edge correlation weights
         self.conv1 = GATConv(
             in_channels=in_channels,
             out_channels=hidden_dim,
@@ -52,6 +52,7 @@ class PeerGAT(nn.Module):
             concat=False,
             dropout=dropout,
             add_self_loops=False,  # Self loops already constructed in graph_builder.py
+            edge_dim=1,
         )
         self.ln1 = nn.LayerNorm(hidden_dim)
         self.act1 = nn.ELU()
@@ -65,6 +66,7 @@ class PeerGAT(nn.Module):
             concat=False,
             dropout=dropout,
             add_self_loops=False,
+            edge_dim=1,
         )
         self.ln2 = nn.LayerNorm(hidden_dim)
         self.act2 = nn.ELU()
@@ -102,7 +104,11 @@ class PeerGAT(nn.Module):
             )
             x = torch.cat([x, pad], dim=1)
         edge_index = data.edge_index
-        edge_attr = data.edge_attr if hasattr(data, "edge_attr") else None
+        edge_attr = data.edge_attr if hasattr(data, "edge_attr") and data.edge_attr is not None else None
+        if edge_attr is None:
+            edge_attr = torch.ones((edge_index.shape[1], 1), dtype=x.dtype, device=x.device)
+        elif edge_attr.ndim == 1:
+            edge_attr = edge_attr.unsqueeze(-1)
 
         # Pass 1: GATConv + LN + ELU + Dropout
         h = self.conv1(x, edge_index, edge_attr=edge_attr)

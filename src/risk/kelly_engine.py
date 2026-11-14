@@ -31,6 +31,7 @@ class ExecutionRecommendation:
             "action": self.action,
             "conviction_tier": self.conviction_tier,
             "unconstrained_kelly_pct": round(self.unconstrained_kelly_pct, 2),
+            "regime_scaled_kelly_pct": round(self.regime_scaled_kelly_pct, 2),
             "l1_normalized_portfolio_allocation_pct": round(
                 self.l1_normalized_portfolio_allocation_pct, 2
             ),
@@ -39,6 +40,7 @@ class ExecutionRecommendation:
             "dynamic_stop_loss": round(self.dynamic_stop_loss, 2),
             "reward_to_risk_ratio": round(self.reward_to_risk_ratio, 2),
             "estimated_round_trip_cost_bps": self.estimated_round_trip_cost_bps,
+            "execution_mode": self.execution_mode,
         }
 
 

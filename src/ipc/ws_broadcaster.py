@@ -7,6 +7,7 @@ matching the Target Output API Contract over ws://127.0.0.1:8194 (canonical Bloo
 import asyncio
 from datetime import datetime, timezone
 import json
+import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Set
 
@@ -33,47 +34,40 @@ def build_qare_signal_frame(
     signal_breakdown: Optional[Dict[str, float]] = None,
     winning_engine: str = "LIGHTGBM_105",
     execution_mode: str = "LONG_ONLY",
+    missing_modalities: Optional[List[str]] = None,
+    intraday_mode: str = "HOURLY_FULL",
+    point_in_time_shifted: bool = True,
+    xbrl_filed_date_verified: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Constructs an institutional QARE-MM v1.3 Target Output API Contract frame.
-    Strictly adheres to PRD Section 2.4.2 specifications.
+    Never synthesizes fake factor scores or fabricated regime transitions when absent.
     """
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     msg_id = f"sig-{int(time.time() * 1000):x}"
 
-    default_regime_probs = {
-        "low_volatility": 0.812,
-        "medium_volatility": 0.145,
-        "high_volatility": 0.043,
-    }
-    eff_probs = regime_probs or default_regime_probs
-    p_med = float(eff_probs.get("medium_volatility", 0.145))
-    p_high = float(eff_probs.get("high_volatility", 0.043))
-    eff_kappa = (
-        round(float(regime_kappa), 2)
-        if regime_kappa is not None
-        else round(0.85 * (1.0 - 0.80 * p_high) * (1.0 - 0.20 * p_med), 2)
+    eff_probs = dict(regime_probs) if regime_probs else {}
+    if regime_kappa is not None:
+        eff_kappa: Optional[float] = round(float(regime_kappa), 2)
+    elif eff_probs:
+        p_med = float(eff_probs.get("medium_volatility", 0.0))
+        p_high = float(eff_probs.get("high_volatility", 0.0))
+        eff_kappa = round(0.85 * (1.0 - 0.80 * p_high) * (1.0 - 0.20 * p_med), 2)
+    else:
+        eff_kappa = None
+
+    eff_transmat = transition_matrix if transition_matrix is not None else []
+    eff_signals = dict(signal_breakdown) if signal_breakdown is not None else {}
+    eff_missing = list(missing_modalities) if missing_modalities is not None else []
+    is_valid_engine = winning_engine != "NONE" and not any(
+        flag in eff_missing
+        for flag in ("PRICE_HISTORY_UNAVAILABLE", "MODEL_WEIGHTS_OR_HISTORY_MISSING", "SIGNAL_COMPUTE_ERROR")
     )
-    eff_transmat = transition_matrix or [
-        [0.898, 0.096, 0.006],
-        [0.185, 0.766, 0.049],
-        [0.012, 0.321, 0.667],
-    ]
-    default_signals = {
-        "residual_momentum_20d_rank": 0.78,
-        "overnight_return_rank": 0.42,
-        "intraday_return_rank": 0.15,
-        "amihud_illiquidity_rank": -0.31,
-        "closing_power_rank": 0.65,
-        "decayed_finbert_sentiment": 0.54,
-        "decayed_form4_insider_cluster": 0.82,
-        "decayed_pead_shock": 0.35,
-        "decayed_10q_legal_risk_delta": -0.04,
-        "decayed_mda_catalyst_score": 0.28,
-        "peer_gat_spillover": 0.49,
-        "smart_money_divergence_pos": 0.0,
-        "smart_money_divergence_neg": 0.19,
-    }
+    eff_xbrl_verified = (
+        bool(xbrl_filed_date_verified)
+        if xbrl_filed_date_verified is not None
+        else is_valid_engine
+    )
 
     return {
         "message_id": msg_id,
@@ -83,10 +77,10 @@ def build_qare_signal_frame(
         "winning_engine": winning_engine,
         "execution_mode": execution_mode,
         "data_integrity": {
-            "point_in_time_shifted": True,
-            "xbrl_filed_date_verified": True,
-            "intraday_mode": "HOURLY_FULL",
-            "missing_modalities": [],
+            "point_in_time_shifted": bool(point_in_time_shifted),
+            "xbrl_filed_date_verified": eff_xbrl_verified,
+            "intraday_mode": intraday_mode,
+            "missing_modalities": eff_missing,
         },
         "macro_regime": {
             "current_state": regime_state,
@@ -95,7 +89,7 @@ def build_qare_signal_frame(
             "filtered_probabilities": eff_probs,
             "transition_matrix": eff_transmat,
         },
-        "signal_breakdown": signal_breakdown or default_signals,
+        "signal_breakdown": eff_signals,
         "calibration": {
             "temperature": round(temperature, 2),
             "calibrated_probabilities": {
@@ -142,6 +136,8 @@ class WebSocketBroadcaster:
         self.pending_signals: Dict[str, Dict[str, Any]] = {}
         self.pending_regime: Optional[Dict[str, Any]] = None
         self.clients: Set[Any] = set()
+        self._client_locks: Dict[Any, asyncio.Lock] = {}
+        self._rpc_semaphore: Optional[asyncio.Semaphore] = None
         self.is_running: bool = False
         self._server = None
         self._conflation_task = None
@@ -186,17 +182,24 @@ class WebSocketBroadcaster:
 
         return json.dumps(frame)
 
+    async def _safe_send(self, client: Any, payload: str) -> None:
+        lock = self._client_locks.setdefault(client, asyncio.Lock())
+        async with lock:
+            await client.send(payload)
+
     async def broadcast_conflated_updates(self) -> None:
         """Flushes and sends conflated updates to all connected subscribers."""
         payload = self.flush_conflated_frame()
         if payload is not None and self.clients:
             disconnected = set()
-            for client in self.clients:
+            for client in list(self.clients):
                 try:
-                    await client.send(payload)
+                    await self._safe_send(client, payload)
                 except Exception:
                     disconnected.add(client)
             self.clients.difference_update(disconnected)
+            for c in disconnected:
+                self._client_locks.pop(c, None)
 
     async def _conflation_loop(self) -> None:
         """Background loop executing conflation flushes."""
@@ -213,8 +216,23 @@ class WebSocketBroadcaster:
             except Exception:
                 pass
 
+    async def _dispatch_client_rpc(self, websocket: Any, message: str) -> None:
+        if not self.rpc_handler:
+            return
+        if self._rpc_semaphore is None:
+            self._rpc_semaphore = asyncio.Semaphore(8)
+        try:
+            async with self._rpc_semaphore:
+                resp = await asyncio.to_thread(self.rpc_handler, message)
+            if resp:
+                await self._safe_send(websocket, resp)
+        except Exception:
+            pass
+
     async def register_client(self, websocket: Any) -> None:
         self.clients.add(websocket)
+        self._client_locks[websocket] = asyncio.Lock()
+        pending_tasks: Set[asyncio.Task[Any]] = set()
         try:
             # Send initial greeting
             welcome = json.dumps({
@@ -223,30 +241,42 @@ class WebSocketBroadcaster:
                 "port": self.port,
                 "timestamp_ms": int(time.time() * 1000),
             })
-            await websocket.send(welcome)
+            await self._safe_send(websocket, welcome)
             async for message in websocket:
                 if self.rpc_handler and isinstance(message, str):
-                    try:
-                        resp = self.rpc_handler(message)
-                        if resp:
-                            await websocket.send(resp)
-                    except Exception:
-                        pass
+                    task = asyncio.create_task(self._dispatch_client_rpc(websocket, message))
+                    pending_tasks.add(task)
+                    task.add_done_callback(pending_tasks.discard)
+            if pending_tasks:
+                await asyncio.gather(*list(pending_tasks), return_exceptions=True)
         except Exception:
             pass
         finally:
+            for t in list(pending_tasks):
+                t.cancel()
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
             self.clients.discard(websocket)
+            self._client_locks.pop(websocket, None)
 
     async def start(self) -> None:
         """Starts WebSocket server and 100ms background conflation loop."""
         try:
             import websockets
 
+            allowed_origins = [
+                None,
+                re.compile(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"),
+                re.compile(r"^tauri://localhost(:\d+)?$"),
+                "https://tauri.localhost",
+                "http://tauri.localhost",
+            ]
             self.is_running = True
             self._server = await websockets.serve(
                 self.register_client,
                 self.host,
                 self.port,
+                origins=allowed_origins,
             )
             self._conflation_task = asyncio.create_task(self._conflation_loop())
         except ImportError:

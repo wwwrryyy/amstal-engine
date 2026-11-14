@@ -121,9 +121,8 @@ class UniquenessWeighter:
         train_mask = t_end_col < split_dt
         train_df = df[train_mask].copy()
 
-        # Embargo rule: Test samples must start AFTER split_date + embargo_days
-        # If business days, shift by business days; otherwise timedelta
-        embargo_dt = split_dt + pd.Timedelta(days=embargo_days)
+        # Embargo rule: Test samples must start AFTER split_date + embargo_days trading days
+        embargo_dt = split_dt + pd.offsets.BDay(embargo_days)
         test_mask = t_start_col >= embargo_dt
         test_df = df[test_mask].copy()
 

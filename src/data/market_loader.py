@@ -4,12 +4,13 @@ Loads daily OHLCV and intraday hourly bars with stateless DuckDB query caching.
 Enforces Point-in-Time (PIT) cutoff at 16:00 America/New_York to eliminate look-ahead bias.
 """
 
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, time as dtime, timedelta, timezone
+import hashlib
 import os
 from pathlib import Path
 import re
 import time
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import duckdb
 import numpy as np
@@ -224,11 +225,60 @@ class MarketDataLoader:
         self.atomic_write_parquet(df_copy, target)
         return target
 
+    @staticmethod
+    def _ticker_seed(ticker: str) -> int:
+        """Process-independent deterministic 31-bit seed derived from SHA-256 of ticker."""
+        digest = hashlib.sha256(ticker.upper().encode("utf-8")).digest()
+        return int.from_bytes(digest[:8], "big") % (2**31)
+
+    @staticmethod
+    def _latest_expected_trading_date() -> pd.Timestamp:
+        """Returns the most recent completed or active US equity business date in America/New_York."""
+        now_et = pd.Timestamp.now(tz="America/New_York")
+        candidate = now_et.normalize().tz_localize(None)
+        if candidate.weekday() == 5:
+            return candidate - pd.Timedelta(days=1)
+        if candidate.weekday() == 6:
+            return candidate - pd.Timedelta(days=2)
+        # Before US market open (09:30 ET), expect previous business day
+        if now_et.time() < dtime(9, 30):
+            return candidate - pd.offsets.BDay(1)
+        return candidate
+
+    @staticmethod
+    def _normalize_yf_df(df_yf: pd.DataFrame) -> pd.DataFrame:
+        """Sanitizes yfinance OHLCV DataFrame to strict lowercase monotonic DatetimeIndex schema."""
+        out = df_yf.copy()
+        if isinstance(out.columns, pd.MultiIndex):
+            out.columns = [c[0].lower() if isinstance(c, tuple) else str(c).lower() for c in out.columns]
+        else:
+            out.columns = [str(c).lower() for c in out.columns]
+
+        idx = pd.to_datetime(out.index)
+        if getattr(idx, "tz", None) is not None:
+            idx = idx.tz_convert("America/New_York").tz_localize(None)
+        out.index = idx.normalize() if len(out) > 0 and (idx == idx.normalize()).mean() > 0.5 else idx
+        out.index.name = "timestamp"
+
+        out = out.dropna(subset=["open", "high", "low", "close"])
+        out = out[(out["open"] > 0) & (out["high"] > 0) & (out["low"] > 0) & (out["close"] > 0)]
+        if "volume" not in out.columns:
+            out["volume"] = 0
+        out["volume"] = out["volume"].fillna(0).clip(lower=0)
+        # Enforce strict OHLC envelope bounds against upstream adjusted-close rounding artifacts
+        out["high"] = np.maximum(out["high"], np.maximum(out["open"], out["close"]))
+        out["low"] = np.minimum(out["low"], np.minimum(out["open"], out["close"]))
+        out["low"] = np.maximum(out["low"], 1e-6)
+        if "vwap" not in out.columns:
+            out["vwap"] = (out["high"] + out["low"] + out["close"]) / 3.0
+        out = out[~out.index.duplicated(keep="last")].sort_index()
+        return out
+
     def generate_synthetic_daily(
         self,
         ticker: str,
         start_date: str = "2015-01-01",
-        end_date: str = "2024-12-31",
+        end_date: Optional[str] = None,
         base_price: float = 100.0,
         drift: float = 0.0004,
         vol: float = 0.015,
@@ -238,8 +288,9 @@ class MarketDataLoader:
         Generates deterministic geometric Brownian motion daily OHLCV + VWAP data on US business days.
         Used for offline unit tests, Gate 1 falsification tests, and CI/CD without network access.
         """
-        rng = np.random.default_rng(seed if seed is not None else abs(hash(ticker)) % (2**31))
-        dates = pd.bdate_range(start=start_date, end=end_date)
+        eff_end = end_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        rng = np.random.default_rng(seed if seed is not None else self._ticker_seed(ticker))
+        dates = pd.bdate_range(start=start_date, end=eff_end)
         n = len(dates)
         if n == 0:
             raise ValueError(f"No business days between {start_date} and {end_date}.")
@@ -285,46 +336,233 @@ class MarketDataLoader:
         self,
         ticker: str,
         start_date: str = "2020-01-01",
-        end_date: str = "2024-12-31",
+        end_date: Optional[str] = None,
         fallback_synthetic: bool = False,
         provider: Optional[str] = None,
+        refresh_if_stale: bool = False,
     ) -> pd.DataFrame:
         """
-        Retrieves daily data from local Parquet cache if available.
-        If missing, attempts fetch via provider (e.g. yfinance); falls back to synthetic data if network/provider unavailable.
+        Retrieves daily data from local Parquet cache if available (optionally catching up stale dates).
+        If missing, attempts fetch via provider (e.g. yfinance); falls back to synthetic data if requested.
         """
-        loaded = self.load_ticker_daily(ticker, start_date=start_date, end_date=end_date)
+        eff_end = end_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        loaded = self.load_ticker_daily(ticker, start_date=start_date, end_date=eff_end)
         if loaded is not None and not loaded.empty:
+            if refresh_if_stale and provider != "synthetic":
+                refreshed = self.refresh_ticker_daily(ticker, target_end_date=eff_end)
+                if refreshed is not None and not refreshed.empty:
+                    return refreshed.loc[start_date:eff_end]
             return loaded
 
         fetched = None
         if provider == "synthetic":
-            fetched = self.generate_synthetic_daily(ticker, start_date=start_date, end_date=end_date)
+            fetched = self.generate_synthetic_daily(ticker, start_date=start_date, end_date=eff_end)
         else:
             try:
                 import yfinance as yf
 
-                df_yf = yf.download(ticker, start=start_date, end=end_date, progress=False, auto_adjust=True)
+                yf_end = (pd.Timestamp(eff_end) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                df_yf = yf.download(
+                    ticker, start=start_date, end=yf_end, progress=False, auto_adjust=True, timeout=5
+                )
                 if df_yf is not None and not df_yf.empty:
-                    if isinstance(df_yf.columns, pd.MultiIndex):
-                        df_yf.columns = [
-                            c[0].lower() if isinstance(c, tuple) else str(c).lower()
-                            for c in df_yf.columns
-                        ]
-                    else:
-                        df_yf.columns = [str(c).lower() for c in df_yf.columns]
-                    df_yf.index.name = "timestamp"
-                    if "vwap" not in df_yf.columns:
-                        df_yf["vwap"] = (df_yf["high"] + df_yf["low"] + df_yf["close"]) / 3.0
-                    self.validate_market_data(df_yf)
-                    fetched = df_yf
+                    df_yf = self._normalize_yf_df(df_yf)
+                    if not df_yf.empty:
+                        self.validate_market_data(df_yf)
+                        fetched = df_yf
             except Exception:
                 fetched = None
 
             if fetched is None and fallback_synthetic:
-                fetched = self.generate_synthetic_daily(ticker, start_date=start_date, end_date=end_date)
+                fetched = self.generate_synthetic_daily(ticker, start_date=start_date, end_date=eff_end)
             elif fetched is None:
                 raise RuntimeError(f"Unable to retrieve market data for '{ticker}' and fallback_synthetic is False.")
 
         self.save_ticker_daily(ticker, fetched)
         return fetched
+
+    def refresh_ticker_daily(
+        self,
+        ticker: str,
+        target_end_date: Optional[str] = None,
+        timeout: float = 5.0,
+    ) -> Optional[pd.DataFrame]:
+        """Incrementally catches up a stale Parquet daily partition via yfinance and atomically saves."""
+        sym = ticker.upper()
+        loaded = self.load_ticker_daily(sym)
+        expected_bday = self._latest_expected_trading_date()
+        eff_end = pd.Timestamp(target_end_date) if target_end_date else expected_bday
+
+        if loaded is not None and not loaded.empty:
+            last_dt = pd.Timestamp(loaded.index.max()).normalize()
+            if last_dt >= min(expected_bday, eff_end):
+                return loaded
+            fetch_start = (last_dt - pd.Timedelta(days=5)).strftime("%Y-%m-%d")
+        else:
+            fetch_start = "2020-01-01"
+
+        try:
+            import yfinance as yf
+
+            yf_end = (eff_end + pd.Timedelta(days=2)).strftime("%Y-%m-%d")
+            df_new = yf.download(
+                sym, start=fetch_start, end=yf_end, progress=False, auto_adjust=True, timeout=timeout
+            )
+            if df_new is None or df_new.empty:
+                return loaded
+            df_new = self._normalize_yf_df(df_new)
+            if df_new.empty:
+                return loaded
+
+            if loaded is not None and not loaded.empty:
+                keep_cols = [c for c in ["open", "high", "low", "close", "volume", "vwap"] if c in loaded.columns and c in df_new.columns]
+                combined = pd.concat([loaded[keep_cols], df_new[keep_cols]])
+                combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+            else:
+                combined = df_new
+
+            self.validate_market_data(combined)
+            self.save_ticker_daily(sym, combined)
+            return combined
+        except Exception:
+            return loaded
+
+    def fetch_live_quote(self, ticker: str, timeout: float = 4.0) -> Optional[Dict[str, Any]]:
+        """Fetches real-time/latest trading-session quote snapshot via yfinance."""
+        sym = ticker.upper()
+        try:
+            import yfinance as yf
+
+            tk = yf.Ticker(sym)
+            price = None
+            open_p = None
+            high_p = None
+            low_p = None
+            prev_c = None
+            volume = 0
+
+            try:
+                fi = tk.fast_info
+                price = fi.get("lastPrice") or fi.get("regularMarketPrice")
+                open_p = fi.get("open") or fi.get("regularMarketOpen")
+                high_p = fi.get("dayHigh") or fi.get("regularMarketDayHigh")
+                low_p = fi.get("dayLow") or fi.get("regularMarketDayLow")
+                prev_c = fi.get("previousClose") or fi.get("regularMarketPreviousClose")
+                vol_val = fi.get("lastVolume") or fi.get("regularMarketVolume")
+                if vol_val:
+                    volume = int(vol_val)
+            except Exception:
+                pass
+
+            hist = tk.history(period="5d", interval="1d", auto_adjust=True, timeout=timeout)
+            bar_date = pd.Timestamp.now(tz="America/New_York").strftime("%Y-%m-%d")
+            if hist is not None and not hist.empty:
+                hist_norm = self._normalize_yf_df(hist)
+                if not hist_norm.empty:
+                    last_row = hist_norm.iloc[-1]
+                    bar_date = pd.Timestamp(hist_norm.index[-1]).strftime("%Y-%m-%d")
+                    if not price or not np.isfinite(float(price)):
+                        price = float(last_row["close"])
+                    if not open_p or not np.isfinite(float(open_p)):
+                        open_p = float(last_row["open"])
+                    if not high_p or not np.isfinite(float(high_p)):
+                        high_p = float(last_row["high"])
+                    if not low_p or not np.isfinite(float(low_p)):
+                        low_p = float(last_row["low"])
+                    if volume <= 0:
+                        volume = int(last_row["volume"])
+                    if (not prev_c or not np.isfinite(float(prev_c))) and len(hist_norm) >= 2:
+                        prev_c = float(hist_norm["close"].iloc[-2])
+
+            if price is None or not np.isfinite(float(price)) or float(price) <= 0:
+                return None
+
+            p_f = float(price)
+            o_f = float(open_p) if open_p and float(open_p) > 0 else p_f
+            h_f = max(float(high_p) if high_p and float(high_p) > 0 else p_f, o_f, p_f)
+            l_f = min(float(low_p) if low_p and float(low_p) > 0 else p_f, o_f, p_f)
+            prev_f = float(prev_c) if prev_c and float(prev_c) > 0 else o_f
+            chg = round(p_f - prev_f, 2)
+            chg_pct = round(((p_f - prev_f) / prev_f) * 100.0, 2) if prev_f > 0 else 0.0
+
+            return {
+                "ticker": sym,
+                "price": round(p_f, 2),
+                "open": round(o_f, 2),
+                "high": round(h_f, 2),
+                "low": round(l_f, 2),
+                "prev_close": round(prev_f, 2),
+                "change": chg,
+                "change_pct": chg_pct,
+                "volume": int(volume),
+                "date": bar_date,
+                "timestamp_ms": int(time.time() * 1000),
+            }
+        except Exception:
+            return None
+
+    def fetch_intraday_bars(
+        self, ticker: str, interval: str = "1h", count: int = 90, timeout: float = 5.0
+    ) -> List[Dict[str, Any]]:
+        """Fetches recent 1H or 4H intraday bars via yfinance for ChartPanel timeframe views."""
+        sym = ticker.upper()
+        try:
+            import yfinance as yf
+
+            df = yf.download(
+                sym, period="60d", interval="60m", progress=False, auto_adjust=True, timeout=timeout
+            )
+            if df is None or df.empty:
+                return []
+
+            out = df.copy()
+            if isinstance(out.columns, pd.MultiIndex):
+                out.columns = [c[0].lower() if isinstance(c, tuple) else str(c).lower() for c in out.columns]
+            else:
+                out.columns = [str(c).lower() for c in out.columns]
+            out = out.dropna(subset=["open", "high", "low", "close"])
+            out["volume"] = out["volume"].fillna(0).clip(lower=0)
+
+            if interval.lower() == "4h":
+                out = out.resample("4h").agg({
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum",
+                }).dropna(subset=["open", "high", "low", "close"])
+
+            out = out.tail(count + 1)
+            records: List[Dict[str, Any]] = []
+            closes = out["close"].values
+            opens = out["open"].values
+            highs = out["high"].values
+            lows = out["low"].values
+            vols = out["volume"].values
+            dates = out.index
+            start_idx = 1 if len(out) > count else 0
+
+            for i in range(start_idx, len(out)):
+                prev_c = closes[i - 1] if i > 0 else opens[i]
+                tot_ret = float(((closes[i] - prev_c) / prev_c) * 100.0) if prev_c > 0 else 0.0
+                on_ret = float(((opens[i] - prev_c) / prev_c) * 100.0) if prev_c > 0 else 0.0
+                intra_ret = float(((closes[i] - opens[i]) / opens[i]) * 100.0) if opens[i] > 0 else 0.0
+                ts = pd.Timestamp(dates[i])
+                if ts.tz is not None:
+                    ts = ts.tz_convert("UTC")
+                records.append({
+                    "date": int(ts.timestamp()),
+                    "open": round(float(opens[i]), 2),
+                    "high": round(float(highs[i]), 2),
+                    "low": round(float(lows[i]), 2),
+                    "close": round(float(closes[i]), 2),
+                    "vwap": round(float((highs[i] + lows[i] + closes[i]) / 3.0), 2),
+                    "volume": int(vols[i]),
+                    "overnight_return": round(on_ret, 2),
+                    "intraday_return": round(intra_ret, 2),
+                    "total_return": round(tot_ret, 2),
+                })
+
+            return records[::-1]
+        except Exception:
+            return []

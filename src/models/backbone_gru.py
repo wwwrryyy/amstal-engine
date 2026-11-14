@@ -69,7 +69,14 @@ class AttentionGRUBackbone:
                 def forward_sequence(self, x: torch.Tensor) -> torch.Tensor:
                     # x: (Batch, T, input_dim)
                     gru_out, _ = self.gru(x)  # (Batch, T, hidden_dim)
-                    attn_out, _ = self.attn(gru_out, gru_out, gru_out)  # (Batch, T, hidden_dim)
+                    seq_len = gru_out.shape[1]
+                    causal_mask = torch.triu(
+                        torch.full((seq_len, seq_len), float("-inf"), dtype=gru_out.dtype, device=gru_out.device),
+                        diagonal=1,
+                    )
+                    attn_out, _ = self.attn(
+                        gru_out, gru_out, gru_out, attn_mask=causal_mask, need_weights=False
+                    )  # (Batch, T, hidden_dim)
                     norm_out = self.ln(gru_out + attn_out)  # Residual connection + LayerNorm: (Batch, T, hidden_dim)
                     return norm_out
 
@@ -180,7 +187,17 @@ class AttentionGRUBackbone:
 
             criterion = nn.CrossEntropyLoss(reduction="none")
 
+            best_val_loss = float("inf")
+            best_state = None
+            val_x_t = None
+            val_y_t = None
+            if eval_set is not None and len(eval_set[0]) > 0:
+                val_x_t = torch.from_numpy(np.asarray(eval_set[0], dtype=np.float32))
+                val_y_t = torch.from_numpy(np.asarray(eval_set[1], dtype=np.int64))
+            val_criterion = nn.CrossEntropyLoss()
+
             for epoch in range(epochs):
+                self.model.train()
                 for b_x, b_y, b_w in loader:
                     optimizer.zero_grad()
                     logits = self.model(b_x)
@@ -188,6 +205,17 @@ class AttentionGRUBackbone:
                     weighted_loss = torch.sum(loss_unweighted * b_w) / (torch.sum(b_w) + 1e-8)
                     weighted_loss.backward()
                     optimizer.step()
+
+                if val_x_t is not None and val_y_t is not None:
+                    self.model.eval()
+                    with torch.no_grad():
+                        val_loss = float(val_criterion(self.model(val_x_t), val_y_t).item())
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        best_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+
+            if best_state is not None:
+                self.model.load_state_dict(best_state)
 
         self.is_fitted_ = True
         return self

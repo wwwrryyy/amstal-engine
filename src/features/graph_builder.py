@@ -8,13 +8,14 @@ Constructs 10-node subgraphs centered at target stock v_0:
 Constructs bidirectional star topology + self-loops with strict Point-in-Time causality.
 """
 
-from typing import Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
-import torch
-from torch_geometric.data import Batch, Data
 
 from src.data.universe import UniverseSelector
+
+if TYPE_CHECKING:
+    from torch_geometric.data import Batch, Data
 
 
 class GraphBuilder:
@@ -212,7 +213,9 @@ class GraphBuilder:
         pairwise_corrs: Optional[Dict[str, float]] = None,
         peer_tickers: Optional[List[str]] = None,
         feature_dim: Optional[int] = None,
-    ) -> Data:
+        residual_returns: Optional[pd.DataFrame] = None,
+        as_of_date: Optional[Union[str, pd.Timestamp]] = None,
+    ) -> "Data":
         """
         Builds a 10-node PyG Data subgraph for target_ticker:
         Node 0: target_ticker (Role = 0.0)
@@ -223,7 +226,16 @@ class GraphBuilder:
         """
         target_ticker = target_ticker.upper()
         if peer_tickers is None or len(peer_tickers) < self.NUM_PEERS:
-            peer_tickers = self.select_peers(target_ticker)
+            if residual_returns is not None:
+                gics_p, ll_p, ll_corrs = self.select_gics_and_lead_lag_peers(
+                    target_ticker, residual_returns=residual_returns, as_of_date=as_of_date
+                )
+                peer_tickers = gics_p + ll_p
+                if pairwise_corrs is None:
+                    pairwise_corrs = ll_corrs
+            else:
+                gics_p, ll_p, _ = self.select_gics_and_lead_lag_peers(target_ticker)
+                peer_tickers = gics_p + ll_p
 
         peers = [p.upper() for p in peer_tickers[:self.NUM_PEERS]]
         while len(peers) < self.NUM_PEERS:
@@ -291,6 +303,9 @@ class GraphBuilder:
             dst_nodes.append(i)
             edge_weights.append([1.0])
 
+        import torch
+        from torch_geometric.data import Data
+
         edge_index = torch.tensor([src_nodes, dst_nodes], dtype=torch.long)
         edge_attr = torch.tensor(edge_weights, dtype=torch.float32)
         x_tensor = torch.tensor(x_mat, dtype=torch.float32)
@@ -304,6 +319,8 @@ class GraphBuilder:
         )
         return data
 
-    def build_batch(self, subgraphs: List[Data]) -> Batch:
+    def build_batch(self, subgraphs: List["Data"]) -> "Batch":
         """Batches a list of PyG Data subgraphs into a single Batch."""
+        from torch_geometric.data import Batch
+
         return Batch.from_data_list(subgraphs)

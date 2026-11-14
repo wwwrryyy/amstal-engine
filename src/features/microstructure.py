@@ -162,16 +162,13 @@ class MicrostructureFeatureExtractor:
         window: int = 14,
     ) -> np.ndarray:
         """ATR_14 / Close ratio."""
-        n = len(close)
-        tr = np.zeros(n, dtype=np.float64)
         prev_close = np.roll(close, 1)
         prev_close[0] = close[0]
-
-        for i in range(n):
-            hl = high[i] - low[i]
-            hc = abs(high[i] - prev_close[i])
-            lc = abs(low[i] - prev_close[i])
-            tr[i] = max(hl, hc, lc)
+        tr = np.maximum.reduce([
+            high - low,
+            np.abs(high - prev_close),
+            np.abs(low - prev_close),
+        ])
 
         atr = pd.Series(tr).rolling(window, min_periods=1).mean().values
         return atr / (close + 1e-8)

@@ -4,6 +4,7 @@ Handles mnemonic execution requests, synchronous signal queries,
 and 2,000ms terminal heartbeat pings from amstal-terminal over /tmp/amstal.sock.
 """
 
+from datetime import datetime, timedelta, timezone
 import asyncio
 import json
 import os
@@ -39,38 +40,50 @@ def parse_mnemonic_command(raw_input: str) -> Dict[str, Any]:
         has_go = True
         tokens = tokens[:-1]
 
-    identifier = "SPY"
+    identifier = ""
     market = "US"
     asset_class = "EQUITY"
     mnemonic = "GP"
     parameters: Dict[str, Any] = {}
 
     # Extract <ASSET CLASS> if present (e.g. <EQUITY>, <INDEX>, <CORP>)
-    asset_class_match = re.search(r"<([A-Za-z]+)>", cleaned)
+    asset_class_match = re.search(r"<(?!GO\b)([A-Za-z]+)>", cleaned, re.IGNORECASE)
     if asset_class_match:
         asset_class = asset_class_match.group(1).upper()
         # Remove the <ASSET_CLASS> token from token list
-        tokens = [t for t in tokens if not re.match(r"^<[A-Za-z]+>$", t)]
+        tokens = [t for t in tokens if not re.match(r"^<(?!GO\b)[A-Za-z]+>$", t, re.IGNORECASE)]
 
+    recognized_markets = ("US", "LN", "GY", "JP", "HK", "IN", "TO", "PA")
     if len(tokens) == 1:
-        # e.g. "HMM", "DES", "PORT", "FA"
+        # e.g. "HMM", "DES", "PORT", "FA" or standalone ticker "NVDA"
         tok = tokens[0].upper()
         if tok in KNOWN_MNEMONICS:
             mnemonic = tok
         else:
             identifier = tok
     elif len(tokens) == 2:
-        # e.g. "NVDA FA", "CRWD PORT", "AAPL GP"
+        # e.g. "NVDA FA", "CRWD PORT", "AAPL US"
         identifier = tokens[0].upper()
-        mnemonic = tokens[1].upper()
+        second = tokens[1].upper()
+        if second in recognized_markets:
+            market = second
+        else:
+            mnemonic = second
     elif len(tokens) >= 3:
-        # e.g. "NVDA US FA"
+        # e.g. "NVDA US FA", "NVDA FA 1D", "NVDA 1D GP"
         identifier = tokens[0].upper()
-        if tokens[1].upper() in ("US", "LN", "GY", "JP", "HK", "IN"):
-            market = tokens[1].upper()
+        t1 = tokens[1].upper()
+        if t1 in recognized_markets:
+            market = t1
             mnemonic = tokens[2].upper()
+            if len(tokens) > 3:
+                parameters["args"] = [t.upper() for t in tokens[3:]]
+        elif t1 in KNOWN_MNEMONICS:
+            mnemonic = t1
+            parameters["args"] = [t.upper() for t in tokens[2:]]
         else:
             mnemonic = tokens[-1].upper()
+            parameters["args"] = [t.upper() for t in tokens[1:-1]]
 
     return {
         "raw_input": raw_input,
@@ -100,9 +113,11 @@ class JsonRpcUdsServer:
         peer_graph_provider: Optional[Callable[[str], Dict[str, Any]]] = None,
         edgar_provider: Optional[Callable[[str], Dict[str, Any]]] = None,
         news_provider: Optional[Callable[[str], List[Dict[str, Any]]]] = None,
-        historical_prices_provider: Optional[Callable[[str, int], List[Dict[str, Any]]]] = None,
+        historical_prices_provider: Optional[Callable[..., List[Dict[str, Any]]]] = None,
         analyst_ratings_provider: Optional[Callable[[str], Dict[str, Any]]] = None,
         copilot_query_provider: Optional[Callable[[str, Optional[str]], Dict[str, Any]]] = None,
+        tick_provider: Optional[Callable[[str], Dict[str, Any]]] = None,
+        financials_provider: Optional[Callable[[str, bool], Dict[str, Any]]] = None,
     ) -> None:
         self.socket_path = socket_path
         self.signal_provider = signal_provider
@@ -115,6 +130,8 @@ class JsonRpcUdsServer:
         self.historical_prices_provider = historical_prices_provider
         self.analyst_ratings_provider = analyst_ratings_provider
         self.copilot_query_provider = copilot_query_provider
+        self.tick_provider = tick_provider
+        self.financials_provider = financials_provider
         self.active_tickers: Set[str] = set()
         self.server: Optional[asyncio.AbstractServer] = None
         self.is_running: bool = False
@@ -177,6 +194,26 @@ class JsonRpcUdsServer:
                     "parsed": parsed,
                     "timestamp": int(time.time() * 1000),
                 },
+                "id": req_id,
+            })
+
+        elif method == "get_tick":
+            ticker = params.get("ticker", "SPY").upper()
+            if self.tick_provider:
+                tick_data = self.tick_provider(ticker)
+            else:
+                tick_data = {
+                    "ticker": ticker,
+                    "price": 0.0,
+                    "change": 0.0,
+                    "change_pct": 0.0,
+                    "volume": 0,
+                    "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    "timestamp_ms": int(time.time() * 1000),
+                }
+            return json.dumps({
+                "jsonrpc": "2.0",
+                "result": tick_data,
                 "id": req_id,
             })
 
@@ -421,12 +458,19 @@ class JsonRpcUdsServer:
         elif method == "get_historical_prices":
             ticker = params.get("ticker", "SPY").upper()
             count = int(params.get("count", 30))
+            interval = str(params.get("interval", "1d"))
             if self.historical_prices_provider:
-                prices_data = self.historical_prices_provider(ticker, count)
+                try:
+                    prices_data = self.historical_prices_provider(ticker, count, interval)
+                except TypeError:
+                    prices_data = self.historical_prices_provider(ticker, count)
             else:
+                now_utc = datetime.now(timezone.utc)
+                d0 = now_utc.strftime("%Y-%m-%d")
+                d1 = (now_utc - timedelta(days=1)).strftime("%Y-%m-%d")
                 prices_data = [
                     {
-                        "date": "2024-12-30",
+                        "date": d0,
                         "open": 134.83,
                         "high": 140.27,
                         "low": 133.99,
@@ -438,7 +482,7 @@ class JsonRpcUdsServer:
                         "total_return": -1.99,
                     },
                     {
-                        "date": "2024-12-27",
+                        "date": d1,
                         "open": 138.54,
                         "high": 139.02,
                         "low": 134.71,
@@ -453,6 +497,30 @@ class JsonRpcUdsServer:
             return json.dumps({
                 "jsonrpc": "2.0",
                 "result": prices_data,
+                "id": req_id,
+            })
+
+        elif method == "get_financials":
+            ticker = params.get("ticker", "NVDA").upper()
+            pit_strict = bool(params.get("pit_strict", True))
+            if self.financials_provider:
+                fin_data = self.financials_provider(ticker, pit_strict)
+            else:
+                fin_data = {
+                    "ticker": ticker,
+                    "available": False,
+                    "source": "UNAVAILABLE",
+                    "pit_strict": pit_strict,
+                    "filings": [],
+                    "incomeStatement": [],
+                    "balanceSheet": [],
+                    "cashFlow": [],
+                    "ratios": [],
+                    "message": "No financials provider configured.",
+                }
+            return json.dumps({
+                "jsonrpc": "2.0",
+                "result": fin_data,
                 "id": req_id,
             })
 
@@ -715,7 +783,7 @@ class JsonRpcUdsServer:
                 raw_str = line.decode("utf-8").strip()
                 if not raw_str:
                     continue
-                response = self.process_message(raw_str)
+                response = await asyncio.to_thread(self.process_message, raw_str)
                 writer.write((response + "\n").encode("utf-8"))
                 await writer.drain()
             except asyncio.CancelledError:

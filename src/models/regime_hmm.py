@@ -4,10 +4,9 @@ Implements causal log-space forward filtering with zero forward-backward lookahe
 Enforces invariant state ordering by SPY return variance (State 0: Low-Vol, State 1: Med-Vol, State 2: High-Vol).
 """
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+import math
 import numpy as np
-from scipy.special import logsumexp
-from scipy.stats import norm
 
 
 class RegimeHMM:
@@ -127,6 +126,19 @@ class RegimeHMM:
 
         return self
 
+    def _extract_diag_variances(self) -> np.ndarray:
+        """Extracts (NUM_STATES, n_features) diagonal emission variances with floor."""
+        if self.covars_.ndim == 3:
+            cov_diag = np.diagonal(self.covars_, axis1=1, axis2=2)
+        else:
+            cov_diag = self.covars_
+        return np.maximum(np.asarray(cov_diag, dtype=np.float64), 1e-8)
+
+    @staticmethod
+    def _logsumexp_1d(vals: np.ndarray) -> float:
+        m = float(np.max(vals))
+        return m + math.log(float(np.sum(np.exp(vals - m))))
+
     def forward_filter_step(
         self,
         x_t: np.ndarray,
@@ -140,23 +152,21 @@ class RegimeHMM:
         if self.means_ is None or self.covars_ is None or self.transmat_ is None:
             raise RuntimeError("GaussianHMM must be fit before filtering.")
 
-        log_emission = np.zeros(self.NUM_STATES)
-        for k in range(self.NUM_STATES):
-            # Extract diagonal variance components
-            if self.covars_.ndim == 3:
-                cov_diag = np.diagonal(self.covars_[k])
-            else:
-                cov_diag = self.covars_[k]
-            scale = np.sqrt(np.maximum(cov_diag, 1e-8))
-            log_emission[k] = np.sum(norm.logpdf(x_t, loc=self.means_[k], scale=scale))
+        x_vec = np.asarray(x_t, dtype=np.float64)
+        vars_diag = self._extract_diag_variances()
+        diff = x_vec[None, :] - self.means_
+        log_emission = -0.5 * np.sum(
+            np.log(2.0 * np.pi * vars_diag) + (diff * diff) / vars_diag,
+            axis=1,
+        )
 
         log_trans = np.log(np.maximum(self.transmat_, 1e-12))
-        log_alpha_tilde = np.zeros(self.NUM_STATES)
-        for k in range(self.NUM_STATES):
-            log_alpha_tilde[k] = log_emission[k] + logsumexp(log_alpha_prev + log_trans[:, k])
+        trans_scores = log_alpha_prev[:, None] + log_trans
+        col_max = np.max(trans_scores, axis=0)
+        log_prior = col_max + np.log(np.sum(np.exp(trans_scores - col_max[None, :]), axis=0))
+        log_alpha_tilde = log_emission + log_prior
 
-        # Normalize in log-space
-        log_norm = logsumexp(log_alpha_tilde)
+        log_norm = self._logsumexp_1d(log_alpha_tilde)
         log_alpha_t = log_alpha_tilde - log_norm
         prob_t = np.exp(log_alpha_t)
 
@@ -172,14 +182,94 @@ class RegimeHMM:
             X_arr = (X_arr - self.mean_) / self.std_
 
         T = len(X_arr)
-        probs = np.zeros((T, self.NUM_STATES))
-        log_alpha = np.log(np.maximum(self.startprob_, 1e-12))
+        probs = np.zeros((T, self.NUM_STATES), dtype=np.float64)
+        if T == 0:
+            return probs
 
-        for t in range(T):
-            prob_t, log_alpha = self.forward_filter_step(X_arr[t], log_alpha)
-            probs[t] = prob_t
+        # Vectorized Gaussian diagonal log-likelihood across all timesteps at once
+        means = np.asarray(self.means_, dtype=np.float64)
+        vars_diag = self._extract_diag_variances()
+        log_norm_const = -0.5 * np.sum(np.log(2.0 * np.pi * vars_diag), axis=1)  # (3,)
+        inv_2var = -0.5 / vars_diag  # (3, D)
+        diff = X_arr[:, None, :] - means[None, :, :]  # (T, 3, D)
+        log_emissions = log_norm_const[None, :] + np.einsum("tkd,kd->tk", diff * diff, inv_2var)
+
+        log_trans = np.log(np.maximum(self.transmat_, 1e-12))
+        log_start = np.log(np.maximum(self.startprob_, 1e-12))
+
+        # Initial step t=0: apply emission likelihood directly to startprob_ prior
+        log_alpha_0 = log_start + log_emissions[0]
+        m0 = float(np.max(log_alpha_0))
+        log_alpha_0 = log_alpha_0 - (m0 + math.log(float(np.sum(np.exp(log_alpha_0 - m0)))))
+        probs[0] = np.exp(log_alpha_0)
+
+        a0, a1, a2 = float(log_alpha_0[0]), float(log_alpha_0[1]), float(log_alpha_0[2])
+        lt00, lt01, lt02 = float(log_trans[0, 0]), float(log_trans[0, 1]), float(log_trans[0, 2])
+        lt10, lt11, lt12 = float(log_trans[1, 0]), float(log_trans[1, 1]), float(log_trans[1, 2])
+        lt20, lt21, lt22 = float(log_trans[2, 0]), float(log_trans[2, 1]), float(log_trans[2, 2])
+
+        exp = math.exp
+        log = math.log
+        em_rows = log_emissions.tolist()
+
+        for t in range(1, T):
+            em0, em1, em2 = em_rows[t]
+
+            # State 0 transition logsumexp
+            x0, x1, x2 = a0 + lt00, a1 + lt10, a2 + lt20
+            mx = x0 if x0 >= x1 else x1
+            if x2 > mx:
+                mx = x2
+            la0 = em0 + mx + log(exp(x0 - mx) + exp(x1 - mx) + exp(x2 - mx))
+
+            # State 1 transition logsumexp
+            x0, x1, x2 = a0 + lt01, a1 + lt11, a2 + lt21
+            mx = x0 if x0 >= x1 else x1
+            if x2 > mx:
+                mx = x2
+            la1 = em1 + mx + log(exp(x0 - mx) + exp(x1 - mx) + exp(x2 - mx))
+
+            # State 2 transition logsumexp
+            x0, x1, x2 = a0 + lt02, a1 + lt12, a2 + lt22
+            mx = x0 if x0 >= x1 else x1
+            if x2 > mx:
+                mx = x2
+            la2 = em2 + mx + log(exp(x0 - mx) + exp(x1 - mx) + exp(x2 - mx))
+
+            mn = la0 if la0 >= la1 else la1
+            if la2 > mn:
+                mn = la2
+            norm = mn + log(exp(la0 - mn) + exp(la1 - mn) + exp(la2 - mn))
+            a0, a1, a2 = la0 - norm, la1 - norm, la2 - norm
+            probs[t, 0] = exp(a0)
+            probs[t, 1] = exp(a1)
+            probs[t, 2] = exp(a2)
 
         return probs
+
+    def get_state_annualized_volatilities(self) -> List[float]:
+        """Returns annualized SPY return volatility (%) for each ordered state."""
+        if self.covars_ is None:
+            return []
+        vars_diag = self._extract_diag_variances()
+        spy_var_std = vars_diag[:, 0]
+        spy_scale = float(self.std_[0]) if (self.standardize and self.std_ is not None and len(self.std_) > 0) else 1.0
+        ann_factor = math.sqrt(252.0) * 100.0
+        return [round(float(math.sqrt(v) * spy_scale * ann_factor), 2) for v in spy_var_std]
+
+    def get_stationary_distribution(self) -> List[float]:
+        """Computes stationary distribution pi solving pi @ transmat = pi."""
+        if self.transmat_ is None:
+            return []
+        A = np.asarray(self.transmat_, dtype=np.float64)
+        vals, vecs = np.linalg.eig(A.T)
+        idx = int(np.argmin(np.abs(vals - 1.0)))
+        pi = np.real(vecs[:, idx])
+        pi = np.maximum(pi, 0.0)
+        s = float(np.sum(pi))
+        if s <= 0.0:
+            return [1.0 / self.NUM_STATES] * self.NUM_STATES
+        return [round(float(v / s), 4) for v in pi]
 
     def get_regime_multiplier(self, probs_t: np.ndarray) -> float:
         """Computes expected macro regime multiplier kappa in [0.25, 0.50]."""

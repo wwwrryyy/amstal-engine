@@ -6,7 +6,8 @@ calibrates with Platt Temperature Scaling, and serializes trained weights to dis
 """
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 import os
@@ -39,6 +40,7 @@ from src.features.microstructure import MicrostructureFeatureExtractor
 from src.features.residualizer import Residualizer
 from src.label.triple_barrier import TripleBarrierLabeler
 from src.label.weights import UniquenessWeighter
+from src.models.backbone_gru import AttentionGRUBackbone
 from src.models.backbone_lgbm import LightGBMBackbone
 from src.models.fusion_net import ModalityMaskedFusionNet
 from src.models.peer_gat import PeerGAT
@@ -62,14 +64,14 @@ class ProductionTrainer:
         lakehouse_dir: Path,
         weights_dir: Path,
         start_date: str = "2020-01-01",
-        end_date: str = "2025-01-01",
+        end_date: Optional[str] = None,
         mode: str = "synthetic",
         random_seed: int = 42,
     ) -> None:
         self.lakehouse_dir = Path(lakehouse_dir)
         self.weights_dir = Path(weights_dir)
         self.start_date = start_date
-        self.end_date = end_date
+        self.end_date = end_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
         self.mode = mode.lower()
         self.random_seed = random_seed
 
@@ -85,26 +87,31 @@ class ProductionTrainer:
         (self.lakehouse_dir / "processed" / "daily").mkdir(parents=True, exist_ok=True)
         (self.lakehouse_dir / "processed" / "hourly").mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _stable_seed(key: str) -> int:
+        return int.from_bytes(hashlib.sha256(key.encode("utf-8")).digest()[:8], "big") % (2**31)
+
     def _save_or_fallback(self, ticker: str, df: Optional[pd.DataFrame]) -> Optional[str]:
-        """Validates and saves DataFrame; falls back to synthetic data if invalid."""
+        """Validates and saves DataFrame; preserves existing data before synthetic fallback."""
         try:
             if df is not None and not df.empty:
-                df_clean = df.copy()
-                df_clean.columns = [str(c).lower() for c in df_clean.columns]
-                df_clean = df_clean.dropna(subset=["open", "high", "low", "close"])
-                if "volume" in df_clean.columns:
-                    df_clean["volume"] = df_clean["volume"].fillna(0.0)
-                if "vwap" not in df_clean.columns:
-                    df_clean["vwap"] = (df_clean["high"] + df_clean["low"] + df_clean["close"]) / 3.0
-                df_clean.index.name = "timestamp"
-
+                df_clean = self.market_loader._normalize_yf_df(df)
                 if len(df_clean) >= 126:
                     self.market_loader.validate_market_data(df_clean)
                     self.market_loader.save_ticker_daily(ticker, df_clean)
                     return ticker
 
+            # Preserve existing disk partition if valid instead of overwriting real data with synthetic GBM
+            existing = self.market_loader.load_ticker_daily(ticker)
+            if existing is not None and len(existing) >= 126:
+                return ticker
+
+            if self.mode == "live":
+                # Keep universe clean if live download temporarily fails when no local data exists
+                return None
+
             # Fallback to deterministic synthetic path
-            seed = abs(hash(f"{ticker}_{self.random_seed}")) % (2**31)
+            seed = self._stable_seed(f"{ticker}_{self.random_seed}")
             df_synth = self.market_loader.generate_synthetic_daily(
                 ticker=ticker,
                 start_date=self.start_date,
@@ -147,6 +154,9 @@ class ProductionTrainer:
         if self.mode == "live":
             import yfinance as yf
 
+            stale_cutoff = (pd.Timestamp(self.end_date) - pd.offsets.BDay(2)).normalize()
+            yf_end = (pd.Timestamp(self.end_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+
             # Chunk into batches of 25 symbols for reliable Yahoo Finance API throughput
             chunk_size = 25
             chunks = [all_tickers[i:i + chunk_size] for i in range(0, len(all_tickers), chunk_size)]
@@ -157,8 +167,10 @@ class ProductionTrainer:
                     if not overwrite:
                         df_ex = self.market_loader.load_ticker_daily(ticker, self.start_date, self.end_date)
                         if df_ex is not None and len(df_ex) >= 126:
-                            successful_tickers.append(ticker)
-                            continue
+                            last_dt = pd.Timestamp(df_ex.index.max()).normalize()
+                            if last_dt >= stale_cutoff:
+                                successful_tickers.append(ticker)
+                                continue
                     tickers_to_fetch.append(ticker)
 
                 if not tickers_to_fetch:
@@ -168,10 +180,11 @@ class ProductionTrainer:
                     df_bulk = yf.download(
                         tickers_to_fetch,
                         start=self.start_date,
-                        end=self.end_date,
+                        end=yf_end,
                         progress=False,
                         auto_adjust=True,
                         group_by="ticker",
+                        timeout=10,
                     )
                 except Exception as e:
                     logger.warning(f"Bulk download failed for chunk {chunk_idx}: {e}")
@@ -236,19 +249,29 @@ class ProductionTrainer:
         logger.info(f"Regime HMM fitted. State variance ordering: {regime_hmm.state_order_}")
 
         # -------------------------------------------------------------
-        # STEP 2: Compute Features & Triple Barrier Labels Across Universe
+        # STEP 2: Compute Features & Residualized Triple Barrier Labels
         # -------------------------------------------------------------
-        logger.info("[2/5] Extracting 105-channel summary features & triple barrier labels...")
+        logger.info("[2/5] Extracting 105-channel features, 126x15 sequences & residual triple-barrier labels...")
         labeler = TripleBarrierLabeler(
             vol_lookback=20,
             upper_multiplier=2.0,
-            lower_multiplier=2.0,
+            lower_multiplier=1.0,
             vertical_horizon=10,
         )
 
+        # Sample-aligned flat buffers (will be chronologically sorted by date before split)
+        sample_dates: List[pd.Timestamp] = []
+        sample_tickers: List[str] = []
         all_features: List[np.ndarray] = []
         all_labels: List[int] = []
         all_weights: List[float] = []
+        seq_dates: List[pd.Timestamp] = []
+        seq_samples: List[np.ndarray] = []
+        seq_labels: List[int] = []
+        seq_weights: List[float] = []
+        residuals_panel: Dict[str, pd.Series] = {}
+        latest_node_vecs: Dict[str, np.ndarray] = {}
+        latest_ticker_labels: Dict[str, int] = {}
 
         equities = [t for t in tickers if t not in self.universe_selector.SECTOR_ETF_MAP.values() and t != "SPY"]
 
@@ -257,14 +280,16 @@ class ProductionTrainer:
             if df_equity is None or len(df_equity) < 126:
                 continue
 
-            sector_etf = self.universe_selector.get_sector_etf(ticker)
+            try:
+                sector_etf = self.universe_selector.get_sector_etf(ticker)
+            except KeyError:
+                sector_etf = "SPY"
             df_sec = self.market_loader.load_ticker_daily(sector_etf, self.start_date, self.end_date)
             if df_sec is None:
                 df_sec = df_spy
 
-            # Align timestamps
             common_idx = df_equity.index.intersection(df_spy.index).intersection(df_sec.index)
-            if len(common_idx) < 126:
+            if len(common_idx) < 156:
                 continue
 
             eq_sub = df_equity.loc[common_idx]
@@ -275,24 +300,34 @@ class ProductionTrainer:
             r_spy = np.diff(np.log(spy_sub["close"].values))
             r_sec = np.diff(np.log(sec_sub["close"].values))
 
-            # Residualize
             roll_res = self.residualizer.compute_rolling_residuals(r_stock, r_spy, r_sec)
             residuals_series = pd.Series(roll_res.residuals, index=eq_sub.index[1:])
+            residuals_panel[ticker] = residuals_series
 
-            # Microstructure features
             channels_df = self.micro_extractor.compute_raw_channels_df(
                 eq_sub.iloc[1:], residuals=residuals_series
             )
-            lgbm_feats = self.micro_extractor.build_lgbm_features(channels_df)
-            if len(lgbm_feats) == 0:
+            seq_tensor = self.micro_extractor.build_sequence_tensor(channels_df)
+            if len(seq_tensor) == 0:
                 continue
-            lgbm_df = pd.DataFrame(lgbm_feats, index=channels_df.index[self.micro_extractor.lookback_window - 1:])
+            lgbm_feats = self.micro_extractor.extract_summary_105(seq_tensor)
+            lgbm_idx = channels_df.index[self.micro_extractor.lookback_window - 1:]
+            lgbm_df = pd.DataFrame(lgbm_feats, index=lgbm_idx)
 
-            # Triple barrier labeling & uniqueness weighting
-            labeled_df = labeler.label_series(eq_sub["close"])
+            # Label strictly on residualized return series per PRD Section 5.4 (never raw price levels!)
+            labeled_df = labeler.label_series(residuals_series)
             if len(labeled_df) == 0:
                 continue
             labeled_df = UniquenessWeighter.weight_labeled_df(labeled_df, normalize=True)
+
+            # Construct compact 10D peer graph node vector for ticker's latest valid date
+            res_20d = float(np.nansum(residuals_series.iloc[-20:])) if len(residuals_series) >= 20 else 0.0
+            res_5d = float(np.nansum(residuals_series.iloc[-5:])) if len(residuals_series) >= 5 else 0.0
+            beta_60 = float(roll_res.betas_mkt[-1]) if not np.isnan(roll_res.betas_mkt[-1]) else 1.0
+            latest_node_vecs[ticker] = GraphBuilder.build_prd_10d_node_vector(
+                res_20d=res_20d, res_5d=res_5d, beta_spy_60d=beta_60, node_role=0.0
+            )
+            latest_ticker_labels[ticker] = int(labeled_df["label"].iloc[-1])
 
             common_dates = lgbm_df.index.intersection(labeled_df.index)
             if len(common_dates) > 0:
@@ -303,28 +338,53 @@ class ProductionTrainer:
                 all_features.append(feat_slice)
                 all_labels.extend(label_slice.tolist())
                 all_weights.extend(weight_slice.tolist())
+                sample_dates.extend(common_dates.tolist())
+                sample_tickers.extend([ticker] * len(common_dates))
+
+                # Subsample sequences every 10 trading days for tractable CPU GRU+Fusion training
+                date_to_pos = {d: i for i, d in enumerate(lgbm_idx)}
+                for j in range(0, len(common_dates), 10):
+                    dt = common_dates[j]
+                    pos = date_to_pos.get(dt)
+                    if pos is not None and pos < len(seq_tensor):
+                        seq_dates.append(dt)
+                        seq_samples.append(seq_tensor[pos])
+                        seq_labels.append(int(label_slice[j]))
+                        seq_weights.append(float(weight_slice[j]))
 
         if not all_features:
             raise RuntimeError("No valid features could be extracted from universe equities.")
 
-        X_all = np.vstack(all_features)
-        y_all = np.array(all_labels, dtype=int)
-        weights_all = np.array(all_weights, dtype=np.float64)
+        X_raw = np.vstack(all_features)
+        y_raw = np.array(all_labels, dtype=int)
+        w_raw = np.array(all_weights, dtype=np.float64)
+        dates_arr = pd.to_datetime(sample_dates).values
 
-        logger.info(f"Total training dataset size: {X_all.shape[0]} samples with 105 structured features.")
+        # Sort globally in strict chronological order so train/val split never leaks future across tickers
+        chrono_order = np.argsort(dates_arr, kind="stable")
+        X_all = X_raw[chrono_order]
+        y_all = y_raw[chrono_order]
+        weights_all = w_raw[chrono_order]
 
-        # Train / validation split (80/20 chronological)
+        unique_classes = np.unique(y_all)
+        class_dist = {int(c): int(np.sum(y_all == c)) for c in unique_classes}
+        logger.info(f"Total training dataset size: {X_all.shape[0]} samples | Class distribution: {class_dist}")
+        if len(unique_classes) < 3:
+            raise RuntimeError(f"Triple-barrier labels collapsed to classes {unique_classes.tolist()}; expected all {{0, 1, 2}}.")
+
+        # Chronological 80/20 split with 10-day purge gap to avoid horizon overlap across the boundary
         split_idx = int(len(y_all) * 0.80)
-        X_train, X_val = X_all[:split_idx], X_all[split_idx:]
-        y_train, y_val = y_all[:split_idx], y_all[split_idx:]
-        w_train, w_val = weights_all[:split_idx], weights_all[split_idx:]
+        purge_offset = min(len(equities) * 10, max(1, (len(y_all) - split_idx) // 10))
+        X_train, y_train, w_train = X_all[:split_idx], y_all[:split_idx], weights_all[:split_idx]
+        val_start = min(split_idx + purge_offset, len(y_all) - 10)
+        X_val, y_val, w_val = X_all[val_start:], y_all[val_start:], weights_all[val_start:]
 
         # -------------------------------------------------------------
         # STEP 3: Fit LightGBM Backbone & Post-Hoc Temperature Scaler
         # -------------------------------------------------------------
         logger.info("[3/5] Fitting LightGBM multiclass backbone...")
-        lgbm_backbone = LightGBMBackbone(n_estimators=100, learning_rate=0.03, random_state=self.random_seed)
-        lgbm_backbone.fit(X_train, y_train, sample_weights=w_train, eval_set=(X_val, y_val), early_stopping_rounds=10)
+        lgbm_backbone = LightGBMBackbone(n_estimators=200, learning_rate=0.03, random_state=self.random_seed)
+        lgbm_backbone.fit(X_train, y_train, sample_weights=w_train, eval_set=(X_val, y_val), early_stopping_rounds=15)
 
         raw_val_probs = lgbm_backbone.predict_proba(X_val)
 
@@ -347,11 +407,71 @@ class ProductionTrainer:
         logger.info(f"Optimal Temperature T={optimal_temp:.4f} | Validation Brier: {brier_uncal:.4f} -> {brier_cal:.4f} (Drop: {brier_reduction*100:.2f}%)")
 
         # -------------------------------------------------------------
-        # STEP 4: Fit Dynamic Peer GAT & Multimodal Fusion Net
+        # STEP 4: Fit Attention-GRU, Dynamic Peer GAT & Multimodal Fusion Net
         # -------------------------------------------------------------
-        logger.info("[5/5] Initializing Dynamic Peer GAT and Modality-Masked Fusion Net...")
+        logger.info("[5/5] Training Attention-GRU, Dynamic Peer GAT, and Modality-Masked Fusion Net...")
+        gru_backbone = AttentionGRUBackbone(input_dim=15, hidden_dim=32, num_heads=2, random_state=self.random_seed)
+        if len(seq_samples) >= 32:
+            seq_order = np.argsort(pd.to_datetime(seq_dates).values, kind="stable")
+            X_seq = np.array(seq_samples, dtype=np.float32)[seq_order]
+            y_seq = np.array(seq_labels, dtype=np.int64)[seq_order]
+            w_seq = np.array(seq_weights, dtype=np.float32)[seq_order]
+            seq_split = int(len(X_seq) * 0.80)
+            gru_backbone.fit(
+                X_seq[:seq_split],
+                y_seq[:seq_split],
+                sample_weights=w_seq[:seq_split],
+                epochs=5,
+                batch_size=64,
+                lr=1e-3,
+                eval_set=(X_seq[seq_split:], y_seq[seq_split:]),
+            )
+            h_temp_all = gru_backbone.extract_latent(X_seq)
+        else:
+            X_seq = np.zeros((16, 126, 15), dtype=np.float32)
+            y_seq = np.zeros(16, dtype=np.int64)
+            w_seq = np.ones(16, dtype=np.float32)
+            seq_split = len(X_seq)
+            h_temp_all = np.zeros((16, 32), dtype=np.float32)
+
         peer_gat = PeerGAT(in_channels=10, hidden_dim=32, random_state=self.random_seed)
+        res_df_panel = pd.DataFrame(residuals_panel) if residuals_panel else None
+        train_subgraphs = []
+        train_graph_labels = []
+        for sym, node_vec in latest_node_vecs.items():
+            sg = self.graph_builder.build_subgraph(
+                target_ticker=sym,
+                node_features=latest_node_vecs,
+                feature_dim=10,
+                residual_returns=res_df_panel,
+            )
+            train_subgraphs.append(sg)
+            train_graph_labels.append(latest_ticker_labels[sym])
+
+        if len(train_subgraphs) >= 4:
+            batch_size_g = 16
+            gat_batches = [
+                self.graph_builder.build_batch(train_subgraphs[i : i + batch_size_g])
+                for i in range(0, len(train_subgraphs), batch_size_g)
+            ]
+            peer_gat.fit(gat_batches, train_graph_labels, epochs=6, lr=0.003)
+
         fusion_net = ModalityMaskedFusionNet(dropout=0.20, random_state=self.random_seed)
+        n_fusion = min(seq_split, len(h_temp_all), 256)
+        if n_fusion >= 16 and len(train_subgraphs) > 0:
+            batch_g = self.graph_builder.build_batch([train_subgraphs[i % len(train_subgraphs)] for i in range(n_fusion)])
+            h_graph_f = peer_gat.extract_latent(batch_g)
+            fusion_net.fit(
+                h_temporal=h_temp_all[:n_fusion],
+                h_graph=h_graph_f,
+                y_train=y_seq[:n_fusion],
+                kappa=0.45,
+                sample_weights=w_seq[:n_fusion],
+                epochs=6,
+                lr=0.003,
+                batch_size=32,
+            )
+        fusion_net.eval()
 
         # Quick forward verification pass
         with torch.no_grad():
@@ -381,18 +501,20 @@ class ProductionTrainer:
         with open(self.weights_dir / "temperature_scaler.pkl", "wb") as f:
             pickle.dump(temp_scaler, f)
 
+        torch.save(gru_backbone.model.state_dict() if gru_backbone.model is not None else {}, self.weights_dir / "gru_backbone.pt")
         torch.save(peer_gat.state_dict(), self.weights_dir / "peer_gat.pt")
         torch.save(fusion_net.state_dict(), self.weights_dir / "fusion_net.pt")
 
         manifest = {
             "version": "QARE-MM-v1.3",
-            "training_timestamp": datetime.utcnow().isoformat() + "Z",
+            "training_timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "start_date": self.start_date,
             "end_date": self.end_date,
             "mode": self.mode,
             "universe_size": len(equities),
             "total_samples": int(X_all.shape[0]),
             "feature_dim": int(X_all.shape[1]),
+            "class_distribution": class_dist,
             "metrics": {
                 "validation_brier_uncalibrated": round(brier_uncal, 4),
                 "validation_brier_calibrated": round(brier_cal, 4),
@@ -404,6 +526,7 @@ class ProductionTrainer:
                 "regime_hmm.pkl",
                 "lightgbm_backbone.pkl",
                 "temperature_scaler.pkl",
+                "gru_backbone.pt",
                 "peer_gat.pt",
                 "fusion_net.pt",
             ],
@@ -426,7 +549,7 @@ def main() -> int:
     parser.add_argument("--lakehouse-dir", default=str(ENGINE_ROOT / "lakehouse"), help="Directory for DuckDB/Parquet store")
     parser.add_argument("--weights-dir", default=str(ENGINE_ROOT / "weights"), help="Directory for serialized weights")
     parser.add_argument("--start-date", default="2020-01-01", help="Start date (YYYY-MM-DD)")
-    parser.add_argument("--end-date", default="2024-12-31", help="End date (YYYY-MM-DD)")
+    parser.add_argument("--end-date", default=None, help="End date (YYYY-MM-DD, defaults to today UTC)")
     parser.add_argument("--tickers", default="", help="Optional comma-separated list of tickers")
     parser.add_argument("--overwrite", action="store_true", help="Force re-download and overwrite existing data")
     args = parser.parse_args()

@@ -118,18 +118,19 @@ class ModalityMaskedFusionNet(nn.Module):
             # Channels 9..11 are Modality Masks (PRD Section 5.10):
             # 0.0 = Missing (Phase 2 Mode), 1.0 = Active (Phase 3 Mode)
             masks = event_features[:, 9:12]
-            any_active = torch.any(masks > 0.01)
+            row_active = torch.any(masks > 0.01, dim=-1, keepdim=True)
 
-            if any_active:
-                # Project event features (B, 12) -> (B, 1, 32)
+            if torch.any(row_active):
+                # Project event features (B, 12) -> (B, 1, 32) per sample without cross-batch leakage
                 e_proj = self.event_proj(event_features).unsqueeze(1)
                 if temporal_seq is not None:
                     # Cross-attention: Query = e_proj (B, 1, 32), Key/Value = temporal_seq (B, T, 32)
                     attn_out, _ = self.cross_attn(query=e_proj, key=temporal_seq, value=temporal_seq)
-                    h_temp_eff = self.ln_cross(attn_out.squeeze(1) + h_temporal)
+                    h_cross = self.ln_cross(attn_out.squeeze(1) + h_temporal)
                 else:
                     # Direct residual blending with temporal pooled state
-                    h_temp_eff = self.ln_cross(e_proj.squeeze(1) + h_temporal)
+                    h_cross = self.ln_cross(e_proj.squeeze(1) + h_temporal)
+                h_temp_eff = torch.where(row_active, h_cross, h_temporal)
 
         # Smart-Money Divergence channels [64..65]
         if d_t is None:
@@ -281,6 +282,7 @@ class ModalityMaskedFusionNet(nn.Module):
         event_features: Optional[np.ndarray] = None,
         temporal_seq: Optional[np.ndarray] = None,
         hmm_probs: Optional[np.ndarray] = None,
+        sample_weights: Optional[np.ndarray] = None,
         epochs: int = 15,
         lr: float = 0.005,
         batch_size: int = 32,
@@ -288,11 +290,16 @@ class ModalityMaskedFusionNet(nn.Module):
         """Fits ModalityMaskedFusionNet on multimodal embeddings and labels."""
         self.train()
         optimizer = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=1e-4)
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(reduction="none")
 
         t_temp = torch.tensor(h_temporal, dtype=torch.float32)
         t_graph = torch.tensor(h_graph, dtype=torch.float32)
         t_y = torch.tensor(y_train, dtype=torch.long)
+        t_w = (
+            torch.tensor(sample_weights, dtype=torch.float32)
+            if sample_weights is not None
+            else torch.ones(len(t_y), dtype=torch.float32)
+        )
         t_dt = torch.tensor(d_t, dtype=torch.float32) if d_t is not None else None
         t_ev = torch.tensor(event_features, dtype=torch.float32) if event_features is not None else None
         t_seq = torch.tensor(temporal_seq, dtype=torch.float32) if temporal_seq is not None else None
@@ -319,7 +326,9 @@ class ModalityMaskedFusionNet(nn.Module):
                     temporal_seq=b_seq,
                     hmm_probs=b_hmm,
                 )
-                loss = criterion(logits, t_y[batch_idx])
+                losses = criterion(logits, t_y[batch_idx])
+                b_w = t_w[batch_idx]
+                loss = torch.sum(losses * b_w) / (torch.sum(b_w) + 1e-8)
                 loss.backward()
                 optimizer.step()
 

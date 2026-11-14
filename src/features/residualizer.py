@@ -210,29 +210,68 @@ class Residualizer:
             )
 
         w = self.window_size
-        for t in range(w, n):
-            # Strict historical window [t-w, t-1]
-            s_hist = spy_returns[t - w : t]
-            e_hist = sector_returns[t - w : t]
-            a_hist = stock_returns[t - w : t]
+        s = np.asarray(spy_returns, dtype=np.float64)
+        e = np.asarray(sector_returns, dtype=np.float64)
+        a = np.asarray(stock_returns, dtype=np.float64)
 
-            # Stage 1: Sector orthogonalization
-            beta_s, alpha_s, nu_s_hist = self.fit_stage1_model(e_hist, s_hist)
+        # Strict historical windows [t - w, t - 1] for t in w..n-1 via zero-copy strided views
+        S = np.lib.stride_tricks.sliding_window_view(s, w)[:-1]
+        E = np.lib.stride_tricks.sliding_window_view(e, w)[:-1]
+        A = np.lib.stride_tricks.sliding_window_view(a, w)[:-1]
 
-            # Day t out-of-sample orthogonal sector return
-            sec_perp_t = sector_returns[t] - (alpha_s + beta_s * spy_returns[t])
-            sector_perp[t] = sec_perp_t
+        ms = np.mean(S, axis=1)
+        me = np.mean(E, axis=1)
+        ma = np.mean(A, axis=1)
 
-            # Stage 2: Stock regression
-            betas = self.estimate_betas(a_hist, s_hist, nu_s_hist)
-            betas_mkt[t] = betas.beta_mkt
-            betas_sec[t] = betas.beta_sec
-            alphas[t] = betas.alpha
-            r_squared[t] = betas.r_squared
+        Sm = S - ms[:, None]
+        Em = E - me[:, None]
+        Am = A - ma[:, None]
 
-            # Day t idiosyncratic residual
-            eps_t = stock_returns[t] - (betas.beta_mkt * spy_returns[t] + betas.beta_sec * sec_perp_t)
-            residuals[t] = eps_t
+        # Stage 1: Sector ETF orthogonalization onto SPY
+        cov_se = np.einsum("ij,ij->i", Sm, Em) / w
+        var_s = np.einsum("ij,ij->i", Sm, Sm) / w
+        beta_s = np.clip(
+            cov_se / (var_s + self.ridge_floor),
+            self.beta_s_mkt_bounds[0],
+            self.beta_s_mkt_bounds[1],
+        )
+        alpha_s = me - beta_s * ms
+        nu_s_hist = E - (alpha_s[:, None] + beta_s[:, None] * S)
+
+        sec_perp_out = e[w:] - (alpha_s + beta_s * s[w:])
+        sector_perp[w:] = sec_perp_out
+
+        # Stage 2: Asset univariate projections onto SPY and orthogonalized sector residual
+        mp = np.mean(nu_s_hist, axis=1)
+        Pm = nu_s_hist - mp[:, None]
+
+        cov_as = np.einsum("ij,ij->i", Am, Sm) / w
+        beta_mkt = np.clip(
+            cov_as / (var_s + self.ridge_floor),
+            self.beta_mkt_bounds[0],
+            self.beta_mkt_bounds[1],
+        )
+
+        cov_ap = np.einsum("ij,ij->i", Am, Pm) / w
+        var_p = np.einsum("ij,ij->i", Pm, Pm) / w
+        beta_sec = np.clip(
+            cov_ap / (var_p + self.ridge_floor),
+            self.beta_sec_bounds[0],
+            self.beta_sec_bounds[1],
+        )
+
+        alpha_out = ma - (beta_mkt * ms + beta_sec * mp)
+        y_hat = alpha_out[:, None] + beta_mkt[:, None] * S + beta_sec[:, None] * nu_s_hist
+        diff_res = A - y_hat
+        ss_res = np.einsum("ij,ij->i", diff_res, diff_res)
+        ss_tot = np.einsum("ij,ij->i", Am, Am)
+        r_sq = np.clip(1.0 - (ss_res / (ss_tot + 1e-12)), 0.0, 1.0)
+
+        betas_mkt[w:] = beta_mkt
+        betas_sec[w:] = beta_sec
+        alphas[w:] = alpha_out
+        r_squared[w:] = r_sq
+        residuals[w:] = a[w:] - (beta_mkt * s[w:] + beta_sec * sec_perp_out)
 
         return RollingResidualOutput(
             residuals=residuals,

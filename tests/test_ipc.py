@@ -8,6 +8,7 @@ Verifies:
 """
 
 import json
+from pathlib import Path
 import pytest
 
 from src.ipc.uds_server import JsonRpcUdsServer, parse_mnemonic_command
@@ -105,6 +106,26 @@ def test_jsonrpc_uds_server_error_handling() -> None:
 
 
 def test_qare_signal_frame_schema() -> None:
+    sample_probs = {
+        "low_volatility": 0.812,
+        "medium_volatility": 0.145,
+        "high_volatility": 0.043,
+    }
+    sample_breakdown = {
+        "residual_momentum_20d_rank": 0.78,
+        "overnight_return_rank": 0.42,
+        "intraday_return_rank": 0.15,
+        "amihud_illiquidity_rank": -0.31,
+        "closing_power_rank": 0.65,
+        "decayed_finbert_sentiment": 0.54,
+        "decayed_form4_insider_cluster": 0.82,
+        "decayed_pead_shock": 0.35,
+        "decayed_10q_legal_risk_delta": -0.04,
+        "decayed_mda_catalyst_score": 0.28,
+        "peer_gat_spillover": 0.49,
+        "smart_money_divergence_pos": 0.0,
+        "smart_money_divergence_neg": 0.19,
+    }
     frame = build_qare_signal_frame(
         ticker="CRWD",
         action="BUY",
@@ -119,6 +140,8 @@ def test_qare_signal_frame_schema() -> None:
         dynamic_take_profit=334.80,
         dynamic_stop_loss=301.20,
         reward_to_risk_ratio=2.0,
+        regime_probs=sample_probs,
+        signal_breakdown=sample_breakdown,
     )
 
     # Validate PRD Section 2.4.2 Target Output API Contract
@@ -135,7 +158,7 @@ def test_qare_signal_frame_schema() -> None:
     # Macro regime block
     assert frame["macro_regime"]["current_state"] == "LOW_VOLATILITY"
     assert frame["macro_regime"]["state_index"] == 0
-    assert "filtered_probabilities" in frame["macro_regime"]
+    assert frame["macro_regime"]["filtered_probabilities"] == sample_probs
 
     # Signal breakdown block: all 13 keys from PRD Section 2.4.2
     assert len(frame["signal_breakdown"]) == 13
@@ -143,6 +166,14 @@ def test_qare_signal_frame_schema() -> None:
     assert "decayed_form4_insider_cluster" in frame["signal_breakdown"]
     assert "decayed_pead_shock" in frame["signal_breakdown"]
     assert "peer_gat_spillover" in frame["signal_breakdown"]
+
+    # Ensure build_qare_signal_frame NEVER invents fake scores or fake probs when omitted
+    empty_frame = build_qare_signal_frame(ticker="CRWD", winning_engine="NONE")
+    assert empty_frame["signal_breakdown"] == {}
+    assert empty_frame["macro_regime"]["filtered_probabilities"] == {}
+    assert empty_frame["macro_regime"]["transition_matrix"] == []
+    assert empty_frame["macro_regime"]["kappa"] is None
+    assert empty_frame["data_integrity"]["xbrl_filed_date_verified"] is False
 
     # Calibration block
     assert frame["calibration"]["temperature"] == 1.34
@@ -332,17 +363,15 @@ def test_websocket_jsonrpc_dispatch() -> None:
         assert greeting["type"] == "CONNECTION_ESTABLISHED"
         assert greeting["port"] == 8199
 
-        # 2. Second message is ping response
-        resp = json.loads(mock_ws.sent[1])
+        # 2 & 3. Correlate concurrent JSON-RPC responses by id
+        by_id = {m["id"]: m for m in (json.loads(raw) for raw in mock_ws.sent[1:])}
+        resp = by_id["ws-rpc-ping"]
         assert resp["jsonrpc"] == "2.0"
-        assert resp["id"] == "ws-rpc-ping"
         assert resp["result"]["status"] == "PONG"
         assert resp["result"]["client_timestamp"] == 12345
 
-        # 3. Third message is command response
-        cmd_resp = json.loads(mock_ws.sent[2])
+        cmd_resp = by_id["ws-rpc-cmd"]
         assert cmd_resp["jsonrpc"] == "2.0"
-        assert cmd_resp["id"] == "ws-rpc-cmd"
         assert cmd_resp["result"]["status"] == "COMMAND_PROCESSED"
         assert cmd_resp["result"]["parsed"]["identifier"] == "NVDA"
         assert cmd_resp["result"]["parsed"]["mnemonic"] == "DES"
@@ -532,21 +561,257 @@ def test_negative_b_lower_barrier_orientation_and_live_providers() -> None:
     assert len(hp) == 10
     assert "vwap" in hp[0]
 
-    # Verify BA resolves from lakehouse with authentic pricing (~176.55)
+    # Verify BA resolves from lakehouse with current BA pricing and 52w range
+    ba_df = provider.market_loader.load_ticker_daily("BA")
+    assert ba_df is not None and len(ba_df) >= 20
+    ba_close = float(ba_df["close"].iloc[-1])
+    ba_window = ba_df.tail(252)
+    ba_high_52w = float(ba_window["high"].max())
+    ba_low_52w = float(ba_window["low"].min())
+
     ba_sig = provider.get_signal("BA")
     ba_rec = ba_sig["execution_recommendation"]
-    assert ba_rec["entry_price"] == pytest.approx(176.55, abs=0.5)
+    assert ba_rec["entry_price"] == pytest.approx(ba_close, abs=0.5)
     assert ba_rec["dynamic_stop_loss"] < ba_rec["entry_price"] < ba_rec["dynamic_take_profit"]
 
     ba_sm = provider.get_security_master("BA")
     assert ba_sm["company_name"] == "Boeing Co."
     assert ba_sm["gics_sector"] == "Industrials"
-    assert ba_sm["high_52w"] == 262.22
-    assert ba_sm["low_52w"] == 137.03
+    assert ba_sm["high_52w"] == pytest.approx(ba_high_52w, abs=0.5)
+    assert ba_sm["low_52w"] == pytest.approx(ba_low_52w, abs=0.5)
 
     ba_anr = provider.get_analyst_ratings("BA")
-    assert ba_anr["current_price"] == pytest.approx(176.55, abs=0.5)
-    assert ba_anr["target_mean"] > ba_anr["current_price"]
+    assert ba_anr["current_price"] == pytest.approx(ba_close, abs=0.5)
+    assert ba_anr["available"] is False
+    assert ba_anr["target_mean"] is None
+    assert ba_anr["total_analysts"] == 0
+
+
+def test_parse_mnemonic_command_standalone_and_extra_tokens() -> None:
+    standalone = parse_mnemonic_command("HMM <GO>")
+    assert standalone["identifier"] == ""
+    assert standalone["mnemonic"] == "HMM"
+
+    three_tok = parse_mnemonic_command("NVDA FA 1D <GO>")
+    assert three_tok["identifier"] == "NVDA"
+    assert three_tok["mnemonic"] == "FA"
+    assert three_tok["parameters"]["args"] == ["1D"]
+
+    four_tok = parse_mnemonic_command("AAPL US GP 1W <GO>")
+    assert four_tok["identifier"] == "AAPL"
+    assert four_tok["market"] == "US"
+    assert four_tok["mnemonic"] == "GP"
+    assert four_tok["parameters"]["args"] == ["1W"]
+
+
+def test_jsonrpc_uds_server_tick_and_interval_forwarding() -> None:
+    seen_calls: list[tuple[str, int, str]] = []
+
+    def tick_fn(ticker: str) -> dict:
+        return {
+            "ticker": ticker,
+            "price": 123.45,
+            "change": 1.25,
+            "change_pct": 1.02,
+            "volume": 9000,
+            "date": "2026-11-13",
+            "timestamp_ms": 1794570000000,
+        }
+
+    def hist_fn_3arg(ticker: str, count: int, interval: str = "1d") -> list[dict]:
+        seen_calls.append((ticker, count, interval))
+        return [{"date": "2026-11-13 10:00", "open": 100.0, "high": 101.0, "low": 99.5, "close": 100.5, "volume": 1000}]
+
+    def hist_fn_2arg(ticker: str, count: int) -> list[dict]:
+        seen_calls.append((ticker, count, "legacy-2arg"))
+        return [{"date": "2026-11-13", "open": 100.0, "high": 101.0, "low": 99.5, "close": 100.5, "volume": 1000}]
+
+    srv = JsonRpcUdsServer(
+        socket_path="/tmp/test_tick_amstal.sock",
+        tick_provider=tick_fn,
+        historical_prices_provider=hist_fn_3arg,
+    )
+
+    tick_resp = json.loads(srv.process_message(json.dumps({
+        "jsonrpc": "2.0",
+        "method": "get_tick",
+        "params": {"ticker": "nvda"},
+        "id": "t1",
+    })))
+    assert tick_resp["result"]["ticker"] == "NVDA"
+    assert tick_resp["result"]["price"] == 123.45
+    assert tick_resp["result"]["date"] == "2026-11-13"
+
+    hist_resp = json.loads(srv.process_message(json.dumps({
+        "jsonrpc": "2.0",
+        "method": "get_historical_prices",
+        "params": {"ticker": "NVDA", "count": 50, "interval": "1h"},
+        "id": "h1",
+    })))
+    assert isinstance(hist_resp["result"], list)
+    assert len(hist_resp["result"]) == 1
+    assert hist_resp["result"][0]["date"] == "2026-11-13 10:00"
+    assert seen_calls[-1] == ("NVDA", 50, "1h")
+
+    srv_legacy = JsonRpcUdsServer(
+        socket_path="/tmp/test_tick_legacy.sock",
+        historical_prices_provider=hist_fn_2arg,
+    )
+    legacy_resp = json.loads(srv_legacy.process_message(json.dumps({
+        "jsonrpc": "2.0",
+        "method": "get_historical_prices",
+        "params": {"ticker": "AAPL", "count": 15, "interval": "4h"},
+        "id": "h2",
+    })))
+    assert isinstance(legacy_resp["result"], list)
+    assert len(legacy_resp["result"]) == 1
+    assert seen_calls[-1] == ("AAPL", 15, "legacy-2arg")
+
+
+def test_live_provider_new_rpcs_offline(tmp_path: Path) -> None:
+    from src.data.fundamentals_client import FundamentalsClient
+    from src.ipc.live_providers import LiveInferenceProvider
+
+    provider = LiveInferenceProvider()
+    provider.fundamentals_client = FundamentalsClient(lakehouse_dir=tmp_path)
+
+    quote = provider.get_latest_quote("NVDA")
+    assert quote["ticker"] == "NVDA"
+    assert quote["price"] > 0
+    assert isinstance(quote["date"], str) and len(quote["date"]) >= 10
+    assert quote["timestamp_ms"] > 0
+
+    hp_1h = provider.get_historical_prices("NVDA", count=10, interval="1h")
+    assert len(hp_1h) == 10
+    assert "vwap" in hp_1h[0]
+
+    graph = provider.get_peer_graph("NVDA")
+    assert graph["target_ticker"] == "NVDA"
+    assert len(graph["nodes"]) >= 3
+    assert len(graph["edges"]) >= 2
+
+    filings = provider.get_edgar_filings("NVDA")
+    assert filings["ticker"] == "NVDA"
+    assert filings["available"] is False
+    assert len(filings["redlines"]) >= 1
+    assert filings["form4_transactions"] == []
+
+    news = provider.get_news_feed("NVDA")
+    assert news == []
+
+    fin = provider.get_financials("NVDA", pit_strict=True)
+    assert fin["ticker"] == "NVDA"
+    assert fin["available"] is False
+
+    copilot = provider.query_copilot("Summarize current risk and conviction for NVDA", ticker="NVDA")
+    assert "response" in copilot and "NVDA" in copilot["response"]
+
+    # Test get_financials JSON-RPC routing on UDS server
+    fin_server = JsonRpcUdsServer(
+        socket_path="/tmp/test_fin_amstal.sock",
+        financials_provider=lambda sym, pit: {
+            "ticker": sym,
+            "available": True,
+            "pit_strict": pit,
+            "filings": [{"period": "FY2025"}],
+            "incomeStatement": [],
+            "balanceSheet": [],
+            "cashFlow": [],
+            "ratios": [],
+        },
+    )
+    fin_resp = json.loads(fin_server.process_message(json.dumps({
+        "jsonrpc": "2.0",
+        "method": "get_financials",
+        "params": {"ticker": "NVDA", "pit_strict": False},
+        "id": "fin-1",
+    })))
+    assert fin_resp["result"]["ticker"] == "NVDA"
+    assert fin_resp["result"]["pit_strict"] is False
+    assert fin_resp["result"]["available"] is True
+
+
+def test_fundamentals_client_xbrl_pit_vs_restated(tmp_path: Path) -> None:
+    from src.data.fundamentals_client import FundamentalsClient
+
+    client = FundamentalsClient(lakehouse_dir=tmp_path)
+    cik = "0001045810"
+    client._write_json_cache(
+        f"edgar_submissions/CIK{cik}.json",
+        {
+            "cik": cik,
+            "recent": {
+                "form": ["10-K", "10-K"],
+                "filingDate": ["2025-02-26", "2024-02-21"],
+                "reportDate": ["2025-01-26", "2024-01-28"],
+                "accessionNumber": ["0001045810-25-000010", "0001045810-24-000010"],
+                "primaryDocument": ["nvda2025.htm", "nvda2024.htm"],
+            },
+        },
+    )
+    client._write_json_cache(
+        f"edgar_facts/CIK{cik}.json",
+        {
+            "cik": cik,
+            "entityName": "NVIDIA CORP",
+            "us_gaap": {
+                "Revenues": {
+                    "units": {
+                        "USD": [
+                            {"form": "10-K", "start": "2023-01-30", "end": "2024-01-28", "filed": "2024-02-21", "accn": "0001045810-24-000010", "val": 60922000000},
+                            {"form": "10-K", "start": "2023-01-30", "end": "2024-01-28", "filed": "2025-02-26", "accn": "0001045810-25-000010", "val": 61200000000},
+                            {"form": "10-K", "start": "2024-01-29", "end": "2025-01-26", "filed": "2025-02-26", "accn": "0001045810-25-000010", "val": 130497000000},
+                        ]
+                    }
+                },
+                "NetIncomeLoss": {
+                    "units": {
+                        "USD": [
+                            {"form": "10-K", "start": "2023-01-30", "end": "2024-01-28", "filed": "2024-02-21", "accn": "0001045810-24-000010", "val": 29760000000},
+                            {"form": "10-K", "start": "2024-01-29", "end": "2025-01-26", "filed": "2025-02-26", "accn": "0001045810-25-000010", "val": 72880000000},
+                        ]
+                    }
+                },
+            },
+        },
+    )
+
+    pit = client.build_financials_payload("NVDA", known_cik=cik, pit_strict=True, enable_live_fetch=False)
+    rest = client.build_financials_payload("NVDA", known_cik=cik, pit_strict=False, enable_live_fetch=False)
+
+    assert pit["available"] is True
+    rev_pit = next(r for r in pit["incomeStatement"] if r["tag"] == "Revenues")["values"]
+    rev_rest = next(r for r in rest["incomeStatement"] if r["tag"] == "Revenues")["values"]
+    assert rev_pit["FY2024"] == 60922.0
+    assert rev_rest["FY2024"] == 61200.0
+    assert rev_pit["FY2025"] == 130497.0
+    f24 = next(f for f in pit["filings"] if f["period"] == "FY2024")
+    assert f24["is_restated"] is True
+
+
+def test_missing_signal_has_no_fabricated_factors_and_ny_market_hours() -> None:
+    import datetime
+    from src.ipc.live_providers import LiveInferenceProvider
+    from src.main import is_us_equity_market_open
+
+    provider = LiveInferenceProvider()
+    missing_sig = provider.get_signal("ZZZZ")
+    assert missing_sig["winning_engine"] == "NONE"
+    assert missing_sig["execution_mode"] == "UNREADY"
+    assert missing_sig["signal_breakdown"] == {}
+    assert missing_sig["data_integrity"]["intraday_mode"] == "UNAVAILABLE"
+    assert missing_sig["data_integrity"]["xbrl_filed_date_verified"] is False
+    assert "PRICE_HISTORY_UNAVAILABLE" in missing_sig["data_integrity"]["missing_modalities"]
+    assert missing_sig["execution_recommendation"]["entry_price"] == 0.0
+
+    # Summer EDT (UTC-4): 13:35 UTC is 09:35 EDT (open); 20:05 UTC is 16:05 EDT (closed)
+    assert is_us_equity_market_open(datetime.datetime(2026, 7, 15, 13, 35, tzinfo=datetime.timezone.utc)) is True
+    assert is_us_equity_market_open(datetime.datetime(2026, 7, 15, 20, 5, tzinfo=datetime.timezone.utc)) is False
+    # Winter EST (UTC-5): 13:45 UTC is 08:45 EST (closed); 20:45 UTC is 15:45 EST (open)
+    assert is_us_equity_market_open(datetime.datetime(2026, 11, 12, 13, 45, tzinfo=datetime.timezone.utc)) is False
+    assert is_us_equity_market_open(datetime.datetime(2026, 11, 12, 20, 45, tzinfo=datetime.timezone.utc)) is True
+    # Weekend Saturday (closed)
+    assert is_us_equity_market_open(datetime.datetime(2026, 11, 14, 16, 0, tzinfo=datetime.timezone.utc)) is False
 
 
 

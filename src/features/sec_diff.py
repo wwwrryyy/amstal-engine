@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 import difflib
 import json
 import math
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -49,7 +50,7 @@ class SecRedlineAnalyzer:
         "adverse", "uncertainty", "decline", "termination", "penalty", "fine",
     }
     RISK_MITIGATION_TERMS = {
-        "resolved", "dismissed", "settled", "remediated", "eliminated", "Compliance",
+        "resolved", "dismissed", "settled", "remediated", "eliminated", "compliance",
         "recovered", "stabilized", "insured", "hedged",
     }
     MDA_POSITIVE_TERMS = {
@@ -201,10 +202,11 @@ class SecRedlineAnalyzer:
                     "Return strict JSON {\"item1a_risk_delta\": float, \"mda_catalyst_score\": float} "
                     f"in [-1.0, 1.0]. Item1A Added: {added_1a[:5]} | MD&A Added: {added_mda[:5]}"
                 )
+                ollama_model = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
                 resp = requests.post(
                     ollama_url,
                     json={
-                        "model": "llama3.1:8b",
+                        "model": ollama_model,
                         "prompt": prompt,
                         "stream": False,
                         "options": {"temperature": 0.0},

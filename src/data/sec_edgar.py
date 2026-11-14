@@ -271,7 +271,8 @@ class Form4Parser:
         # Parse non-derivative transactions
         for tx_node in root.findall(".//nonDerivativeTransaction"):
             code_node = tx_node.find(".//transactionCoding/transactionCode")
-            code = code_node.text.strip().upper() if code_node is not None and code_node.text else "P"
+            raw_code = code_node.text.strip().upper() if code_node is not None and code_node.text else ""
+            code = raw_code
 
             date_node = tx_node.find(".//transactionDate/value")
             tx_date = date_node.text.strip() if date_node is not None and date_node.text else effective_filing_date
@@ -291,9 +292,9 @@ class Form4Parser:
             acq_node = tx_node.find(".//transactionAmounts/transactionAcquiredDisposedCode/value")
             acq_disp = acq_node.text.strip().upper() if acq_node is not None and acq_node.text else "A"
 
-            # If transactionCode is S or disposed 'D', mark as sale
-            if acq_disp == "D" and code != "S":
-                code = "S"
+            # Infer P/S only when XML transactionCode was absent
+            if not code:
+                code = "S" if acq_disp == "D" else "P"
 
             transactions.append(
                 StandardInsiderTransaction(
