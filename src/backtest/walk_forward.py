@@ -5,7 +5,7 @@ Enforces:
 """
 
 from dataclasses import dataclass
-from typing import Generator, List, Optional
+from typing import Generator, Optional
 import numpy as np
 
 

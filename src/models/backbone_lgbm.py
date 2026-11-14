@@ -4,7 +4,7 @@ Consumes (Batch, 105) structured multi-scale summary features with intra-ticker 
 Predicts ternary triple-barrier outcomes {0: Buy, 1: Hold, 2: Sell} with post-hoc Temperature Scaling calibration.
 """
 
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple
 import numpy as np
 from scipy.optimize import minimize_scalar
 from scipy.special import logsumexp

@@ -5,7 +5,6 @@ deterministic US-GAAP XBRL tag fallback hierarchy, and Form 4 XML cluster scorin
 """
 
 from dataclasses import dataclass
-from datetime import datetime
 import math
 import os
 import re

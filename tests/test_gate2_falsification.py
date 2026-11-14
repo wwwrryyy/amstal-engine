@@ -9,13 +9,11 @@ Verifies:
 
 import numpy as np
 import pandas as pd
-import pytest
 import torch
 
 from src.backtest.metrics import BacktestMetrics
 from src.data.universe import UniverseSelector
 from src.features.graph_builder import GraphBuilder
-from src.models.backbone_gru import AttentionGRUBackbone
 from src.models.peer_gat import PeerGAT
 from src.models.regime_hmm import RegimeHMM
 from src.models.fusion_net import ModalityMaskedFusionNet

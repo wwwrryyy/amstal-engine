@@ -8,7 +8,6 @@ Executes Phase 2 Gate 2 falsification battery:
 """
 
 import sys
-import time
 import numpy as np
 import pandas as pd
 import torch

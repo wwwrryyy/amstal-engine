@@ -6,8 +6,8 @@ dynamic volatility barriers, macro regime scaling kappa in [0.25, 0.50],
 single-stock ceilings (10% soft, 15% hard cap), and cross-sectional L1 portfolio normalization.
 """
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple
 import numpy as np
 from scipy.optimize import minimize_scalar
 

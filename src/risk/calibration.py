@@ -4,7 +4,6 @@ Fits temperature parameter T > 0 by minimizing Negative Log-Likelihood (NLL)
 on the 126-day validation fold to produce well-calibrated ternary probabilities.
 """
 
-from typing import Optional, Union
 import numpy as np
 from scipy.optimize import minimize_scalar
 from scipy.special import logsumexp

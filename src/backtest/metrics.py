@@ -3,7 +3,7 @@ Quantitative Validation Metrics & Performance Analytics
 Computes Rank Information Coefficient (IC), Brier Calibration Score, and Net-of-15bps Sharpe.
 """
 
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 import numpy as np
 from scipy.stats import spearmanr
 

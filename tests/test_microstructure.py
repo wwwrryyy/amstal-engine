@@ -11,7 +11,6 @@ Verifies:
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from src.features.microstructure import MicrostructureFeatureExtractor, CHANNEL_NAMES
 

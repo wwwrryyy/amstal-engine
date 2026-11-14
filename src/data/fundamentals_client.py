@@ -259,8 +259,8 @@ class FundamentalsClient:
                             "underperform": int(row.get("sell", 0) or 0),
                             "sell": int(row.get("strongSell", 0) or 0),
                         })
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Yahoo recommendations_summary unavailable for {sym}: {e}")
 
             # Insider transactions
             insiders: List[Dict[str, Any]] = []
@@ -290,8 +290,8 @@ class FundamentalsClient:
                             "is_10b5_1": ("10b5-1" in text_desc or "automatic" in text_desc or "plan" in text_desc),
                             "raw_text": str(row.get("Text") or row.get("Transaction") or "").strip(),
                         })
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Yahoo insider_transactions unavailable for {sym}: {e}")
 
             payload = {
                 "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

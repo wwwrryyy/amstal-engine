@@ -8,7 +8,6 @@ Verifies:
 """
 
 import numpy as np
-import pytest
 import torch
 
 from src.features.graph_builder import GraphBuilder

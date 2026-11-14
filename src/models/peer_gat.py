@@ -5,7 +5,7 @@ Aggregates cross-sectional peer spillover into a 32-dimensional graph latent rep
 Explicitly pinned to CPU threads to bypass Apple Silicon MPS kernel fallback overhead.
 """
 
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import List, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn

@@ -9,12 +9,10 @@ Verifies:
 
 import math
 import numpy as np
-import pandas as pd
 import pytest
 import torch
 
 from src.backtest.metrics import BacktestMetrics
-from src.data.sec_edgar import Form4Parser, StandardInsiderTransaction
 from src.features.event_decay import EventDecayKernel
 from src.models.fusion_net import ModalityMaskedFusionNet
 

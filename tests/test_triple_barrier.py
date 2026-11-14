@@ -8,12 +8,10 @@ Verifies:
 5. Calendar-date purging and 10-day embargo fold splitting
 """
 
-from pathlib import Path
 import numpy as np
 import pandas as pd
-import pytest
 
-from src.label.triple_barrier import TripleBarrierLabeler, BarrierResult
+from src.label.triple_barrier import TripleBarrierLabeler
 from src.label.weights import UniquenessWeighter
 
 

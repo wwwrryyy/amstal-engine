@@ -4,7 +4,7 @@ Implements causal log-space forward filtering with zero forward-backward lookahe
 Enforces invariant state ordering by SPY return variance (State 0: Low-Vol, State 1: Med-Vol, State 2: High-Vol).
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 import math
 import numpy as np
 

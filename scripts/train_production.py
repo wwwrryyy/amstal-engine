@@ -10,13 +10,12 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import logging
-import os
 from pathlib import Path
 import pickle
 import resource
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -34,7 +33,6 @@ import torch
 
 from src.data.market_loader import MarketDataLoader
 from src.data.universe import UniverseSelector
-from src.features.event_decay import EventDecayKernel
 from src.features.graph_builder import GraphBuilder
 from src.features.microstructure import MicrostructureFeatureExtractor
 from src.features.residualizer import Residualizer
@@ -46,7 +44,6 @@ from src.models.fusion_net import ModalityMaskedFusionNet
 from src.models.peer_gat import PeerGAT
 from src.models.regime_hmm import RegimeHMM
 from src.risk.calibration import TemperatureScaler
-from src.risk.kelly_engine import MultiOutcomeKellySizer
 
 # Setup logging
 logging.basicConfig(

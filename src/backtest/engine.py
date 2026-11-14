@@ -5,11 +5,11 @@ and out-of-sample quantitative performance attribution net of 15 bps friction.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional
 import numpy as np
 
 from src.backtest.metrics import BacktestMetrics
-from src.backtest.walk_forward import FoldIndices, WalkForwardSplitter
+from src.backtest.walk_forward import WalkForwardSplitter
 from src.models.backbone_lgbm import LightGBMBackbone
 
 

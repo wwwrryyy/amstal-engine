@@ -8,7 +8,7 @@ with a 10-day vertical horizon barrier to produce ternary classification labels:
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 

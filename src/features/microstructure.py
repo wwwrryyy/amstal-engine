@@ -6,7 +6,7 @@ Generates:
 3. Daily Cross-Sectional Rank Normalization: [-1.0, +1.0] across active universe assets
 """
 
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 from scipy.stats import rankdata

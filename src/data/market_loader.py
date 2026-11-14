@@ -6,6 +6,7 @@ Enforces Point-in-Time (PIT) cutoff at 16:00 America/New_York to eliminate look-
 
 from datetime import datetime, time as dtime, timedelta, timezone
 import hashlib
+import logging
 import os
 from pathlib import Path
 import re
@@ -15,6 +16,8 @@ from typing import Any, Dict, List, Optional, Union
 import duckdb
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger("amstal.market_loader")
 
 
 class MarketDataLoader:
@@ -451,8 +454,8 @@ class MarketDataLoader:
                 vol_val = fi.get("lastVolume") or fi.get("regularMarketVolume")
                 if vol_val:
                     volume = int(vol_val)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Yahoo fast_info fallback triggered for {sym}: {e}")
 
             hist = tk.history(period="5d", interval="1d", auto_adjust=True, timeout=timeout)
             bar_date = pd.Timestamp.now(tz="America/New_York").strftime("%Y-%m-%d")

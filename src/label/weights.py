@@ -8,7 +8,7 @@ and enforces cross-ticker calendar-date purging and embargo boundaries:
 - Embargo: enforces a 10-day buffer gap before out-of-sample evaluation begins
 """
 
-from typing import List, Optional, Tuple, Union
+from typing import List, Tuple, Union
 import numpy as np
 import pandas as pd
 

@@ -9,12 +9,11 @@ Verifies:
 """
 
 from pathlib import Path
-import numpy as np
 import pandas as pd
 import pytest
 
 from src.data.market_loader import MarketDataLoader
-from src.data.universe import UniverseSelector, SecurityMasterRecord
+from src.data.universe import UniverseSelector
 
 
 def test_universe_selector_target_size_and_sectors() -> None:
@@ -242,7 +241,7 @@ def test_fetch_or_load_daily_synthetic_cache(tmp_path: Path) -> None:
 
 
 def test_sec_edgar_rate_limiter() -> None:
-    from src.data.sec_edgar import SecEdgarClient, TokenBucketRateLimiter
+    from src.data.sec_edgar import SecEdgarClient
     import time
 
     # Test User-Agent validation

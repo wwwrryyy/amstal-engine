@@ -13,7 +13,6 @@ import pytest
 
 from src.risk.calibration import TemperatureScaler
 from src.risk.kelly_engine import (
-    ExecutionRecommendation,
     MultiOutcomeKellySizer,
     PortfolioExposureNormalizer,
 )

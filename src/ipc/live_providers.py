@@ -279,8 +279,8 @@ class LiveInferenceProvider:
                     index=pd.DatetimeIndex([q_ts], name=df_live.index.name or "timestamp"),
                 )
                 return pd.concat([df_live, new_row]).sort_index()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Live quote overlay skipped: {e}")
         return df
 
     def get_macro_regime(self) -> Dict[str, Any]:

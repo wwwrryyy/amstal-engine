@@ -13,7 +13,7 @@ Also computes Signed Smart-Money Divergence [D_t^+, D_t^-] for channels 64..65 o
 
 from dataclasses import dataclass
 import math
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 

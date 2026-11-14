@@ -10,9 +10,9 @@ Verifies:
 import numpy as np
 import pytest
 
-from src.backtest.engine import BacktestResult, FoldMetrics, WalkForwardBacktester
+from src.backtest.engine import BacktestResult, WalkForwardBacktester
 from src.backtest.metrics import BacktestMetrics
-from src.backtest.walk_forward import FoldIndices, WalkForwardSplitter
+from src.backtest.walk_forward import WalkForwardSplitter
 
 
 def test_walk_forward_splitter_geometry() -> None:

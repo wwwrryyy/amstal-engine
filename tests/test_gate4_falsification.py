@@ -17,7 +17,6 @@ import pytest
 from src.backtest.metrics import BacktestMetrics
 from src.risk.calibration import TemperatureScaler
 from src.risk.kelly_engine import (
-    ExecutionRecommendation,
     MultiOutcomeKellySizer,
     PortfolioExposureNormalizer,
 )

@@ -12,12 +12,10 @@ Verifies:
 from pathlib import Path
 import time
 import numpy as np
-import pandas as pd
-import pytest
 
 from src.data.market_loader import MarketDataLoader
 from src.data.universe import UniverseSelector
-from src.features.residualizer import Residualizer, BetaEstimates
+from src.features.residualizer import Residualizer
 
 
 def test_sector_orthogonalization(synthetic_factor_returns) -> None:

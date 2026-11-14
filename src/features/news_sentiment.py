@@ -6,6 +6,7 @@ Signed Smart-Money Divergence [D_t^+, D_t^-].
 """
 
 from dataclasses import dataclass
+import logging
 import math
 from typing import List, Optional, Tuple, Union
 
@@ -13,6 +14,8 @@ import pandas as pd
 
 from src.data.market_loader import MarketDataLoader
 from src.features.event_decay import EventDecayKernel
+
+logger = logging.getLogger("amstal.news_sentiment")
 
 
 @dataclass(frozen=True)
@@ -84,8 +87,8 @@ class FinBertSentimentEngine:
                 res = self._pipeline(text[:512])[0]
                 probs = {item["label"].lower(): float(item["score"]) for item in res}
                 return float(probs.get("positive", 0.0) - probs.get("negative", 0.0))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"FinBERT scoring fallback to lexicon: {e}")
 
         words = [w.strip(".,!?;:()[]\"'").lower() for w in text.split()]
         pos_hits = sum(1 for w in words if w in self.POSITIVE_LEXICON)

@@ -9,7 +9,7 @@ Applies HMM Sigmoid Gate Linear(3 -> 66) + regime multiplier kappa in [0.25, 0.5
 followed by Classification Head: Linear(66 -> 32) + LayerNorm + SiLU + Dropout(0.3) + Linear(32 -> 3).
 """
 
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 import numpy as np
 from scipy.optimize import minimize_scalar
 from scipy.special import logsumexp

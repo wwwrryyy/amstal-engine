@@ -47,8 +47,6 @@ if not ENGINE.is_dir():
 
 # --- Check 1: Root vs Engine File Synchronization ---
 sync_files = ["PRD.md", "architecture.md"]
-if (ROOT / "README.md").exists() or (ENGINE / "README.md").exists():
-    sync_files.append("README.md")
 
 for fname in sync_files:
     root_file = ROOT / fname
@@ -67,17 +65,13 @@ arch_text = (ENGINE / "architecture.md").read_text() if (ENGINE / "architecture.
 readme_text = (ENGINE / "README.md").read_text() if (ENGINE / "README.md").exists() else ""
 
 docs_to_check = [("PRD.md", prd_text), ("architecture.md", arch_text)]
-if readme_text:
-    docs_to_check.append(("README.md", readme_text))
-
 spec_docs = [("PRD.md", prd_text)]
-if readme_text:
-    spec_docs.append(("README.md", readme_text))
+stale_docs = docs_to_check + ([("README.md", readme_text)] if readme_text else [])
 
 # --- Check 2: Stale References ---
 stale_terms = ["Stockman", "stockman", "Arrow Flight", "8195"]
 for term in stale_terms:
-    for name, text in docs_to_check:
+    for name, text in stale_docs:
         if term in text:
             errors.append(f"Stale term '{term}' found in {name}")
 

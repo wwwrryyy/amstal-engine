@@ -9,7 +9,6 @@ Executes:
 """
 
 import numpy as np
-import pytest
 
 from src.backtest.engine import WalkForwardBacktester
 from src.backtest.metrics import BacktestMetrics
