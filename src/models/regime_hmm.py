@@ -265,18 +265,32 @@ class RegimeHMM:
         vals, vecs = np.linalg.eig(A.T)
         idx = int(np.argmin(np.abs(vals - 1.0)))
         pi = np.real(vecs[:, idx])
+        # Perron-Frobenius left eigenvector has uniform sign up to +/-1 phase
+        if float(np.sum(pi)) < 0.0:
+            pi = -pi
         pi = np.maximum(pi, 0.0)
         s = float(np.sum(pi))
-        if s <= 0.0:
+        if not math.isfinite(s) or s <= 0.0:
             return [1.0 / self.NUM_STATES] * self.NUM_STATES
         return [round(float(v / s), 4) for v in pi]
 
     def get_regime_multiplier(self, probs_t: np.ndarray) -> float:
-        """Computes expected macro regime multiplier kappa in [0.25, 0.50]."""
-        p = np.asarray(probs_t, dtype=np.float64)
+        """Computes expected macro regime multiplier kappa in [0.25, 0.50]; fails closed to 0.25 on invalid inputs."""
+        try:
+            p = np.asarray(probs_t, dtype=np.float64)
+        except (TypeError, ValueError):
+            return 0.25
+        if p.ndim != 1 or p.shape[0] != 3 or not np.all(np.isfinite(p)):
+            return 0.25
+        if np.any(p < 0.0) or np.any(p > 1.0):
+            return 0.25
+        s = float(np.sum(p))
+        if not (0.98 <= s <= 1.02):
+            return 0.25
+        p_norm = p / s
         kappa = (
-            p[0] * self.REGIME_MULTIPLIERS[0]
-            + p[1] * self.REGIME_MULTIPLIERS[1]
-            + p[2] * self.REGIME_MULTIPLIERS[2]
+            p_norm[0] * self.REGIME_MULTIPLIERS[0]
+            + p_norm[1] * self.REGIME_MULTIPLIERS[1]
+            + p_norm[2] * self.REGIME_MULTIPLIERS[2]
         )
-        return float(np.clip(kappa, 0.25, 0.50))
+        return float(np.clip(kappa, 0.25, 0.50)) if math.isfinite(float(kappa)) else 0.25

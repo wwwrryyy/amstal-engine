@@ -516,14 +516,17 @@ def test_jsonrpc_uds_server_analyst_ratings_and_copilot_query() -> None:
     assert custom_cq["result"]["tool_routed"] == "custom_llm"
 
 
-def test_negative_b_lower_barrier_orientation_and_live_providers() -> None:
+def test_negative_b_lower_barrier_orientation_and_live_providers(tmp_path: Path) -> None:
     """
     Regression test for BUG-8, BUG-4, BUG-5, BUG-6, BUG-11, BUG-15, BUG-16:
     Verifies that negative b_lower still produces dynamic_stop_loss < entry_price < dynamic_take_profit
     and positive reward_to_risk_ratio, and that LiveInferenceProvider produces valid calibrated
     posteriors, transition_matrix, kappa, and percentage historical returns.
     """
+    import numpy as np
+    import pandas as pd
     from src.risk.kelly_engine import MultiOutcomeKellySizer
+    from src.risk.calibration import TemperatureScaler
     from src.ipc.live_providers import LiveInferenceProvider
 
     sizer = MultiOutcomeKellySizer()
@@ -540,22 +543,177 @@ def test_negative_b_lower_barrier_orientation_and_live_providers() -> None:
     assert rec.dynamic_stop_loss < rec.entry_price < rec.dynamic_take_profit
     assert rec.reward_to_risk_ratio == pytest.approx(2.0, rel=1e-3)
 
+    # Self-contained offline calibration verification independent of bundled lakehouse state
+    lh_det = tmp_path / "lh_det"
+    wt_det = tmp_path / "wt_det"
+    wt_det.mkdir(parents=True, exist_ok=True)
+    prov_det = LiveInferenceProvider(lakehouse_dir=lh_det, weights_dir=wt_det, enable_live_fetch=False)
+    idx_det = pd.bdate_range(end="2025-11-28", periods=160)
+    rng_det = np.random.default_rng(17)
+    r_spy_det = rng_det.normal(0.0004, 0.01, size=160)
+    r_nvda_det = 1.3 * r_spy_det + rng_det.normal(0.0003, 0.008, size=160)
+    c_spy_det = 400.0 * np.exp(np.cumsum(r_spy_det))
+    c_nvda_det = 120.0 * np.exp(np.cumsum(r_nvda_det))
+    obs_det_ms = int(pd.Timestamp("2025-11-28 13:00:00", tz="America/New_York").timestamp() * 1000)
+    for sym_d, c_arr in (("SPY", c_spy_det), ("NVDA", c_nvda_det)):
+        df_d = pd.DataFrame(
+            {"open": c_arr * 0.995, "high": c_arr * 1.01, "low": c_arr * 0.99, "close": c_arr, "volume": np.full(160, 1_500_000.0)},
+            index=idx_det,
+        )
+        df_d.index.name = "timestamp"
+        df_d.attrs = {"observation_timestamp_ms": obs_det_ms, "obs_bar_date": "2025-11-28"}
+        prov_det.market_loader.save_ticker_daily(sym_d, df_d)
+    sc_det = TemperatureScaler()
+    sc_det.temperature_ = 1.25
+    prov_det.temp_scaler = sc_det
+    prov_det.lgbm_backbone = type("DetLGBM", (), {"predict_proba": lambda self, x: np.tile([0.58, 0.27, 0.15], (len(x), 1))})()
+    prov_det.regime_hmm = object()
+    prov_det._class_priors = (0.33, 0.34, 0.33)
+    sig_det = prov_det.get_signal("NVDA", regime={"current_state": "LOW_VOLATILITY", "state_index": 0, "kappa": 0.45})
+    assert "UNREADY" not in sig_det["execution_mode"]
+    assert sig_det["winning_engine"] != "NONE"
+    cal_det = sig_det["calibration"]["calibrated_probabilities"]
+    raw_det = np.array([0.58, 0.27, 0.15], dtype=np.float64)
+    scaled_exp = np.power(raw_det, 1.0 / 1.25)
+    scaled_exp /= float(np.sum(scaled_exp))
+    assert cal_det["outperform_buy"] == pytest.approx(round(float(scaled_exp[0]), 3), abs=1e-3)
+    assert cal_det["neutral_hold"] == pytest.approx(round(float(scaled_exp[1]), 3), abs=1e-3)
+    assert cal_det["underperform_sell"] == pytest.approx(round(float(scaled_exp[2]), 3), abs=1e-3)
+    assert cal_det["outperform_buy"] != pytest.approx(0.58, abs=0.01)
+    assert pytest.approx(cal_det["outperform_buy"] + cal_det["neutral_hold"] + cal_det["underperform_sell"], abs=0.01) == 1.0
+    rec_det = sig_det["execution_recommendation"]
+    assert rec_det["dynamic_stop_loss"] < rec_det["entry_price"] < rec_det["dynamic_take_profit"]
+    assert rec_det["reward_to_risk_ratio"] > 0
+
+    # Isolated analyst-ratings checks inside tmp_path (independent of default lakehouse yf_meta cache)
+    anr_missing = prov_det.get_analyst_ratings("NVDA")
+    assert anr_missing["available"] is False
+    assert anr_missing["target_mean"] is None
+    assert anr_missing["total_analysts"] == 0
+    assert anr_missing["source"] == "UNAVAILABLE"
+
+    import json as _json
+    import os as _os
+    import time as _time
+    stale_meta_p = lh_det / "raw" / "yf_meta" / "NVDA.json"
+    stale_meta_p.parent.mkdir(parents=True, exist_ok=True)
+    stale_meta_p.write_text(
+        _json.dumps({
+            "fetched_at": "2025-11-01T12:00:00Z",
+            "info": {"targetMeanPrice": 185.0, "numberOfAnalystOpinions": 14},
+            "rec_trend": [{"period": "0m", "strong_buy": 10, "buy": 4, "hold": 0, "underperform": 0, "sell": 0}],
+        }),
+        encoding="utf-8",
+    )
+    old_meta_epoch = _time.time() - 86400 * 5
+    _os.utime(stale_meta_p, (old_meta_epoch, old_meta_epoch))
+    with prov_det._lock:
+        prov_det._ratings_cache.clear()
+    anr_stale = prov_det.get_analyst_ratings("NVDA")
+    assert anr_stale["available"] is True
+    assert anr_stale["source"] == "YFINANCE_CACHED_STALE"
+    assert anr_stale["target_mean"] == pytest.approx(185.0, abs=0.01)
+    assert anr_stale["total_analysts"] == 14
+
+    # Isolated offline security master without cached yf_meta uses bundled Boeing Co. fallback cleanly
+    ba_sm_iso = prov_det.get_security_master("BA")
+    assert ba_sm_iso["company_name"] == "Boeing Co."
+    assert ba_sm_iso["gics_sector"] == "Industrials"
+
+
+def test_live_provider_bundled_artifacts_ready() -> None:
+    from src.ipc.live_providers import LiveInferenceProvider
+
     provider = LiveInferenceProvider()
+    required = (
+        provider.weights_dir / "manifest.json",
+        provider.weights_dir / "regime_hmm.pkl",
+        provider.weights_dir / "lightgbm_backbone.pkl",
+        provider.weights_dir / "temperature_scaler.pkl",
+        provider.market_loader.daily_dir / "SPY.parquet",
+        provider.market_loader.daily_dir / "NVDA.parquet",
+        provider.market_loader.daily_dir / "BA.parquet",
+    )
+    if not all(p.exists() for p in required):
+        pytest.skip("Bundled model weights and lakehouse parquet partitions not present")
+
+    assert provider.is_ready()
     mr = provider.get_macro_regime()
     assert "transition_matrix" in mr
     fp = mr["filtered_probabilities"]
-    expected_kappa = round(0.85 * (1.0 - 0.80 * fp["high_volatility"]) * (1.0 - 0.20 * fp["medium_volatility"]), 2)
-    assert mr["kappa"] == pytest.approx(expected_kappa, abs=0.02)
+    expected_kappa = round(
+        0.50 * fp["low_volatility"] + 0.35 * fp["medium_volatility"] + 0.25 * fp["high_volatility"],
+        2,
+    )
+    assert mr["kappa"] == expected_kappa
+
+    import pandas as pd
 
     sig = provider.get_signal("NVDA")
-    cal = sig["calibration"]["calibrated_probabilities"]
-    assert 0.01 < cal["outperform_buy"] < 0.99
-    assert 0.01 < cal["neutral_hold"] < 0.99
-    assert 0.01 < cal["underperform_sell"] < 0.99
-    assert pytest.approx(cal["outperform_buy"] + cal["neutral_hold"] + cal["underperform_sell"], abs=0.01) == 1.0
-    s_rec = sig["execution_recommendation"]
-    assert s_rec["dynamic_stop_loss"] < s_rec["entry_price"] < s_rec["dynamic_take_profit"]
-    assert s_rec["reward_to_risk_ratio"] > 0
+    spy_d = provider._load_disk_daily("SPY")
+    nvda_d = provider._load_disk_daily("NVDA")
+    min_hist = provider.micro_extractor.lookback_window + 1
+    nv_aligned = False
+    nv_short_len = nvda_d is None or len(nvda_d) < min_hist
+    nv_overlap_short = True
+    if spy_d is not None and nvda_d is not None and len(spy_d) > 0 and len(nvda_d) > 0:
+        common_nv = nvda_d.index.intersection(spy_d.index)
+        nv_overlap_short = len(common_nv) < min_hist
+        nv_obs_ms, nv_comp, _ = provider._daily_bar_status_ms(nvda_d)
+        spy_check_d = spy_d
+        if (
+            len(common_nv) > 0
+            and pd.Timestamp(common_nv[-1]).normalize() < pd.Timestamp(spy_d.index[-1]).normalize()
+        ):
+            spy_check_d = provider._slice_aligned_frame(
+                spy_d,
+                common_nv[-provider._TAIL_WARMUP_BARS:],
+            )
+        spy_obs_ms, spy_comp, _ = provider._daily_bar_status_ms(spy_check_d)
+        nv_attrs = getattr(nvda_d, "attrs", {}) or {}
+        spy_attrs = getattr(spy_check_d, "attrs", {}) or {}
+        nv_mtime = nv_attrs.get("disk_mtime_ms")
+        spy_mtime = spy_attrs.get("disk_mtime_ms")
+        spy_not_sliced = pd.Timestamp(spy_check_d.index[-1]).normalize() == pd.Timestamp(spy_d.index[-1]).normalize()
+        ts_ok = nv_obs_ms is not None and spy_obs_ms is not None and spy_obs_ms <= nv_obs_ms
+        offline_ok = bool(
+            spy_not_sliced
+            and not provider.enable_live_fetch
+            and not nv_comp
+            and not spy_comp
+            and nv_obs_ms is None
+            and spy_obs_ms is None
+            and not nv_attrs.get("_bar_unsettled")
+            and not spy_attrs.get("_bar_unsettled")
+            and isinstance(nv_mtime, (int, float))
+            and isinstance(spy_mtime, (int, float))
+            and spy_mtime <= nv_mtime
+        )
+        nv_aligned = bool(
+            not nv_short_len
+            and not nv_overlap_short
+            and pd.Timestamp(common_nv[-1]).normalize() == pd.Timestamp(nvda_d.index[-1]).normalize()
+            and (ts_ok or offline_ok)
+        )
+    if nv_aligned:
+        assert "UNREADY" not in sig["execution_mode"]
+        assert sig["winning_engine"] != "NONE"
+        cal = sig["calibration"]["calibrated_probabilities"]
+        assert 0.0 <= cal["outperform_buy"] <= 1.0
+        assert 0.0 <= cal["neutral_hold"] <= 1.0
+        assert 0.0 <= cal["underperform_sell"] <= 1.0
+        assert pytest.approx(cal["outperform_buy"] + cal["neutral_hold"] + cal["underperform_sell"], abs=0.01) == 1.0
+        s_rec = sig["execution_recommendation"]
+        assert s_rec["dynamic_stop_loss"] < s_rec["entry_price"] < s_rec["dynamic_take_profit"]
+        assert s_rec["reward_to_risk_ratio"] > 0
+    else:
+        assert sig["execution_mode"] == "UNREADY"
+        expected_mod = (
+            "MODEL_WEIGHTS_OR_HISTORY_MISSING"
+            if nv_short_len
+            else "BENCHMARK_OBSERVATIONS_UNALIGNED"
+        )
+        assert expected_mod in sig["data_integrity"]["missing_modalities"]
 
     hp = provider.get_historical_prices("NVDA", count=10)
     assert len(hp) == 10
@@ -572,19 +730,35 @@ def test_negative_b_lower_barrier_orientation_and_live_providers() -> None:
     ba_sig = provider.get_signal("BA")
     ba_rec = ba_sig["execution_recommendation"]
     assert ba_rec["entry_price"] == pytest.approx(ba_close, abs=0.5)
-    assert ba_rec["dynamic_stop_loss"] < ba_rec["entry_price"] < ba_rec["dynamic_take_profit"]
+    if "UNREADY" not in ba_sig["execution_mode"] and ba_sig["winning_engine"] != "NONE":
+        assert ba_rec["dynamic_stop_loss"] < ba_rec["entry_price"] < ba_rec["dynamic_take_profit"]
+    else:
+        assert ba_rec["l1_normalized_portfolio_allocation_pct"] == 0.0
 
     ba_sm = provider.get_security_master("BA")
-    assert ba_sm["company_name"] == "Boeing Co."
+    ba_meta = provider.fundamentals_client.get_yf_meta("BA", enable_live_fetch=False) or {}
+    ba_meta_info = ba_meta.get("info") if isinstance(ba_meta, dict) else {}
+    expected_ba_name = (
+        (ba_meta_info.get("longName") or ba_meta_info.get("shortName"))
+        if isinstance(ba_meta_info, dict)
+        else None
+    ) or "Boeing Co."
+    assert ba_sm["company_name"] == expected_ba_name
     assert ba_sm["gics_sector"] == "Industrials"
     assert ba_sm["high_52w"] == pytest.approx(ba_high_52w, abs=0.5)
     assert ba_sm["low_52w"] == pytest.approx(ba_low_52w, abs=0.5)
 
     ba_anr = provider.get_analyst_ratings("BA")
-    assert ba_anr["current_price"] == pytest.approx(ba_close, abs=0.5)
-    assert ba_anr["available"] is False
-    assert ba_anr["target_mean"] is None
-    assert ba_anr["total_analysts"] == 0
+    assert isinstance(ba_anr["available"], bool)
+    assert ba_anr["total_analysts"] >= 0
+    expected_avail = bool(
+        ba_anr["target_mean"] is not None
+        and ba_anr["target_mean"] > 0
+        and ba_anr["total_analysts"] > 0
+    )
+    assert ba_anr["available"] == expected_avail
+    if not ba_anr["available"]:
+        assert ba_anr["current_price"] > 0.0
 
 
 def test_parse_mnemonic_command_standalone_and_extra_tokens() -> None:

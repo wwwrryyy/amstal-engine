@@ -368,9 +368,17 @@ class TokenBucketRateLimiter:
         self.last_update = time.monotonic()
         self.lock = threading.Lock()
 
-    def acquire(self, tokens: float = 1.0) -> float:
-        """Blocks until requested tokens are available. Returns time waited."""
-        with self.lock:
+    def acquire(self, tokens: float = 1.0, deadline: Optional[float] = None) -> float:
+        """Blocks until requested tokens are available (respecting optional monotonic deadline). Returns wait time or -1.0 on budget timeout."""
+        if deadline is not None:
+            rem_lock = deadline - time.monotonic()
+            if rem_lock <= 0.0:
+                return -1.0
+            if not self.lock.acquire(timeout=rem_lock):
+                return -1.0
+        else:
+            self.lock.acquire()
+        try:
             total_waited = 0.0
             while True:
                 now = time.monotonic()
@@ -378,13 +386,20 @@ class TokenBucketRateLimiter:
                 self.last_update = now
                 self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
 
+                if deadline is not None and now >= deadline:
+                    return -1.0
+
                 if self.tokens >= tokens:
                     self.tokens -= tokens
                     return total_waited
 
                 sleep_time = (tokens - self.tokens) / self.rate
+                if deadline is not None and (now + sleep_time) > deadline:
+                    return -1.0
                 time.sleep(sleep_time)
                 total_waited += sleep_time
+        finally:
+            self.lock.release()
 
 
 class SecEdgarClient:

@@ -7,6 +7,8 @@ single-stock ceilings (10% soft, 15% hard cap), and cross-sectional L1 portfolio
 """
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+import math
 from typing import Any, Dict, Optional, Tuple
 import numpy as np
 from scipy.optimize import minimize_scalar
@@ -88,7 +90,8 @@ class MultiOutcomeKellySizer:
             b_tilde_k = R_k - mu_p_bar  =>  sum_k p_bar_k * b_tilde_k == 0
         Guarantees Gate 4 Criterion #2: any zero-skill model outputting prior probabilities
         has marginal net return -c = -0.0015 < 0, yielding strictly f* = 0.0%.
-        Returns (b_upper_centered, b_lower_loss_mag_centered, b_vert_centered).
+        Returns (b_upper_centered, b_lower_loss_mag_centered, b_vert_centered), assuming
+        r_lower - mu_prior <= 0 for the magnitude element; internal solving preserves sign.
         """
         p_b, p_h, p_s = prior_probs
         tot = p_b + p_h + p_s
@@ -107,46 +110,82 @@ class MultiOutcomeKellySizer:
 
         return float(b_upper_tilde), float(abs(r_lower_tilde)), float(b_vert_tilde)
 
-    def solve_unconstrained_kelly(
+    @staticmethod
+    def _normalize_prior(
+        prior: Optional[Tuple[float, float, float]],
+    ) -> Optional[Tuple[float, float, float]]:
+        """Validates and normalizes a 3-class prior probability tuple without overflow."""
+        if prior is None or len(prior) != 3:
+            return None
+        decs: list[Decimal] = []
+        for v in prior:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                return None
+            if isinstance(v, float) and (not math.isfinite(v) or v < 0.0):
+                return None
+            if isinstance(v, int) and v < 0:
+                return None
+            try:
+                decs.append(Decimal(v))
+            except (InvalidOperation, ValueError):
+                return None
+        max_d = max(decs)
+        if max_d <= 0:
+            return None
+        sb, sh, ss = float(decs[0] / max_d), float(decs[1] / max_d), float(decs[2] / max_d)
+        etot = sb + sh + ss
+        if not math.isfinite(etot) or etot <= 0.0:
+            return None
+        return (sb / etot, sh / etot, ss / etot)
+
+    def _solve_unconstrained_with_prior(
         self,
         p_buy: float,
         p_hold: float,
         p_sell: float,
         b_upper: float,
         b_lower: float,
-        b_vert: float = 0.0,
-        prior_probs: Optional[Tuple[float, float, float]] = None,
+        b_vert: float,
+        resolved_prior: Optional[Tuple[float, float, float]],
     ) -> float:
-        """
-        Solves for the optimal unconstrained fraction f* in [0, soft_ceiling].
-        Returns 0.0 if expected net edge <= 0 or if probabilities reflect zero-skill prior.
-        """
-        eff_prior = prior_probs if prior_probs is not None else self.prior_probs
-
+        eff_prior = resolved_prior
         # Zero-skill uniform probability guard (Gate 4 Criterion #2)
         if eff_prior is None and abs(p_buy - p_hold) < 1e-6 and abs(p_hold - p_sell) < 1e-6:
             eff_prior = (1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0)
 
+        r_upper = float(b_upper)
+        r_lower = -abs(float(b_lower))
+        r_vert = float(b_vert)
+
         if eff_prior is not None:
-            b_u, b_l, b_v = self.center_payoffs(b_upper, b_lower, b_vert, prior_probs=eff_prior)
+            p0_b, p0_h, p0_s = eff_prior
+            tot0 = p0_b + p0_h + p0_s
+            if tot0 > 0:
+                p0_b, p0_h, p0_s = p0_b / tot0, p0_h / tot0, p0_s / tot0
+            mu_prior = p0_b * r_upper + p0_s * r_lower + p0_h * r_vert
+            r_buy_raw = r_upper - mu_prior
+            r_sell_raw = r_lower - mu_prior
+            r_hold_raw = r_vert - mu_prior
         else:
-            b_u, b_l, b_v = float(b_upper), abs(float(b_lower)), float(b_vert)
+            r_buy_raw = r_upper
+            r_sell_raw = r_lower
+            r_hold_raw = r_vert
 
         c = self.round_trip_cost
-        r_buy_net = b_u - c
-        r_sell_net = -(b_l + c)  # Loss magnitude is (b_l + c)
-        r_hold_net = b_v - c
+        r_buy_net = r_buy_raw - c
+        r_sell_net = r_sell_raw - c
+        r_hold_net = r_hold_raw - c
 
         # First derivative at f = 0: E[R_net]
         dG_0 = p_buy * r_buy_net + p_sell * r_sell_net + p_hold * r_hold_net
         if dG_0 <= 1e-12:
             return 0.0
 
-        # Maximum feasible f before total loss: f < 1 / (b_l + c)
-        loss_barrier = b_l + c
+        # Maximum feasible f before total loss across any outcome: 1 + f * r_k_net > 0
+        worst_loss = max(0.0, -r_buy_net, -r_sell_net, -r_hold_net)
         upper_limit = (
-            min(self.soft_ceiling, 0.99 / loss_barrier)
-            if loss_barrier > 0
+            min(self.soft_ceiling, 0.99 / worst_loss)
+            if worst_loss > 0
             else self.soft_ceiling
         )
 
@@ -176,6 +215,32 @@ class MultiOutcomeKellySizer:
         f_opt = float(np.clip(res.x, 0.0, self.soft_ceiling))
         return f_opt
 
+    def solve_unconstrained_kelly(
+        self,
+        p_buy: float,
+        p_hold: float,
+        p_sell: float,
+        b_upper: float,
+        b_lower: float,
+        b_vert: float = 0.0,
+        prior_probs: Optional[Tuple[float, float, float]] = None,
+    ) -> float:
+        """
+        Solves for the optimal unconstrained fraction f* in [0, soft_ceiling].
+        Returns 0.0 if expected net edge <= 0 or if probabilities reflect zero-skill prior.
+        """
+        raw_prior = prior_probs if prior_probs is not None else self.prior_probs
+        eff_prior = self._normalize_prior(raw_prior)
+        return self._solve_unconstrained_with_prior(
+            p_buy=p_buy,
+            p_hold=p_hold,
+            p_sell=p_sell,
+            b_upper=b_upper,
+            b_lower=b_lower,
+            b_vert=b_vert,
+            resolved_prior=eff_prior,
+        )
+
     def compute_recommendation(
         self,
         p_buy: float,
@@ -199,6 +264,8 @@ class MultiOutcomeKellySizer:
             p_hold /= total_p
             p_sell /= total_p
 
+        eff_prior = self._normalize_prior(prior_probs if prior_probs is not None else self.prior_probs)
+
         f_star = self.solve_unconstrained_kelly(
             p_buy=p_buy,
             p_hold=p_hold,
@@ -215,21 +282,42 @@ class MultiOutcomeKellySizer:
         kappa_clamped = float(np.clip(kappa, 0.25, 0.50))
         f_regime = float(np.clip(f_star * kappa_clamped, 0.0, self.hard_cap))
 
+        # Action classification
+        f_short_star = 0.0
+        if eff_prior is not None:
+            p0_b, _, p0_s = eff_prior
+            if f_star > 0.005 and p_buy > p0_b:
+                action = "BUY"
+            else:
+                f_short_star = self.solve_unconstrained_kelly(
+                    p_buy=p_sell,
+                    p_hold=p_hold,
+                    p_sell=p_buy,
+                    b_upper=abs(b_lower),
+                    b_lower=abs(b_upper),
+                    b_vert=-b_vert,
+                    prior_probs=(eff_prior[2], eff_prior[1], eff_prior[0]),
+                )
+                if f_short_star > 0.005 and p_sell > p0_s:
+                    action = "SELL"
+                else:
+                    action = "HOLD"
+        else:
+            if f_star > 0.005 and p_buy > p_sell:
+                action = "BUY"
+            elif p_sell > p_buy and p_sell > 0.45:
+                action = "SELL"
+            else:
+                action = "HOLD"
+
         # Conviction tier
-        if p_buy >= 0.60 or f_star >= 0.06:
+        edge_f = f_star if action == "BUY" else (f_short_star if action == "SELL" else 0.0)
+        if (action == "BUY" and p_buy >= 0.60) or (action == "SELL" and p_sell >= 0.60) or edge_f >= 0.06:
             conviction = "HIGH"
-        elif p_buy >= 0.45 or f_star >= 0.02:
+        elif (action == "BUY" and p_buy >= 0.45) or (action == "SELL" and p_sell >= 0.45) or edge_f >= 0.02:
             conviction = "MEDIUM"
         else:
             conviction = "LOW"
-
-        # Action classification
-        if f_star > 0.005 and p_buy > p_sell:
-            action = "BUY"
-        elif p_sell > p_buy and p_sell > 0.45:
-            action = "SELL"
-        else:
-            action = "HOLD"
 
         # Gate 4 Criterion 4: Execution Mode Integrity
         if mode == "LONG_ONLY":
@@ -241,17 +329,20 @@ class MultiOutcomeKellySizer:
                 norm_pct = 0.0
             else:
                 norm_pct = (
-                    l1_normalized_pct
+                    float(l1_normalized_pct)
                     if l1_normalized_pct is not None
                     else f_regime * 100.0
                 )
         else:
             # LONG_SHORT diagnostic stat-arb mode
             if action == "SELL":
-                f_star = -f_star if f_star > 0 else -0.05
+                if eff_prior is not None and f_short_star > 0.0:
+                    f_star = -f_short_star
+                else:
+                    f_star = -f_star if f_star > 0 else -0.05
                 f_regime = float(np.clip(f_star * kappa_clamped, -self.hard_cap, 0.0))
                 norm_pct = (
-                    l1_normalized_pct
+                    -abs(float(l1_normalized_pct))
                     if l1_normalized_pct is not None
                     else f_regime * 100.0
                 )
@@ -261,7 +352,7 @@ class MultiOutcomeKellySizer:
                 norm_pct = 0.0
             else:
                 norm_pct = (
-                    l1_normalized_pct
+                    float(l1_normalized_pct)
                     if l1_normalized_pct is not None
                     else f_regime * 100.0
                 )
@@ -269,9 +360,15 @@ class MultiOutcomeKellySizer:
         p_0 = float(entry_price)
         b_u_mag = abs(float(b_upper))
         b_l_mag = abs(float(b_lower))
-        dynamic_tp = p_0 * (1.0 + b_u_mag)
-        dynamic_sl = p_0 * (1.0 - b_l_mag)
-        r_to_r = float(b_u_mag / (b_l_mag + 1e-12))
+        if mode != "LONG_ONLY" and action == "SELL" and f_star < 0.0:
+            # Active short position: profit at lower barrier (-b_lower), stop out at upper barrier (+b_upper)
+            dynamic_tp = p_0 * (1.0 - b_l_mag)
+            dynamic_sl = p_0 * (1.0 + b_u_mag)
+            r_to_r = float(b_l_mag / (b_u_mag + 1e-12))
+        else:
+            dynamic_tp = p_0 * (1.0 + b_u_mag)
+            dynamic_sl = p_0 * (1.0 - b_l_mag)
+            r_to_r = float(b_u_mag / (b_l_mag + 1e-12))
 
         return ExecutionRecommendation(
             action=action,

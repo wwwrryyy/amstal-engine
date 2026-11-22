@@ -7,6 +7,7 @@ and 2,000ms terminal heartbeat pings from amstal-terminal over /tmp/amstal.sock.
 from datetime import datetime, timedelta, timezone
 import asyncio
 import json
+import math
 import os
 import re
 import time
@@ -251,7 +252,7 @@ class JsonRpcUdsServer:
                 regime_data = {
                     "current_state": "LOW_VOLATILITY",
                     "state_index": 0,
-                    "kappa": 0.80,
+                    "kappa": 0.47,
                     "filtered_probabilities": {
                         "low_volatility": 0.812,
                         "medium_volatility": 0.145,
@@ -647,28 +648,49 @@ class JsonRpcUdsServer:
                         reg = {
                             "current_state": "LOW_VOLATILITY",
                             "state_index": 0,
-                            "kappa": 0.80,
+                            "kappa": 0.47,
                             "filtered_probabilities": {
                                 "low_volatility": 0.812,
                                 "medium_volatility": 0.145,
                                 "high_volatility": 0.043,
                             },
                         }
+                    from src.ipc.ws_broadcaster import _sanitize_json_obj, normalize_regime_probs
+
                     state = reg.get("current_state", "LOW_VOLATILITY")
-                    kappa = reg.get("kappa", 0.80)
+                    raw_k = reg.get("kappa")
+                    kappa: Optional[float] = (
+                        float(raw_k)
+                        if isinstance(raw_k, (int, float)) and not isinstance(raw_k, bool) and math.isfinite(float(raw_k))
+                        else None
+                    )
+                    kappa_str = f"{kappa:.2f}" if kappa is not None else "N/A"
                     state_idx = reg.get("state_index", 0)
-                    probs = reg.get("filtered_probabilities", {})
-                    p_low = probs.get("low_volatility", 0.0)
-                    p_med = probs.get("medium_volatility", 0.0)
-                    p_high = probs.get("high_volatility", 0.0)
+                    clean_probs = (
+                        normalize_regime_probs(reg.get("filtered_probabilities"))
+                        if reg.get("available") is not False
+                        else {}
+                    )
+                    if clean_probs:
+                        p_low = clean_probs["low_volatility"]
+                        p_med = clean_probs["medium_volatility"]
+                        p_high = clean_probs["high_volatility"]
+                        probs_text = (
+                            f"Forward-filtered regime probabilities: "
+                            f"Low Volatility: {p_low * 100:.1f}%, Medium Volatility: {p_med * 100:.1f}%, "
+                            f"High Volatility / Turbulent: {p_high * 100:.1f}%."
+                        )
+                    else:
+                        probs_text = "Forward-filtered regime probabilities: unavailable."
                     resp_text = (
                         f"Macro Volatility Regime Analysis: Current State is {state} (State Index: {state_idx}, "
-                        f"Kelly Multiplier kappa: {kappa:.2f}). Forward-filtered regime probabilities: "
-                        f"Low Volatility: {p_low * 100:.1f}%, Medium Volatility: {p_med * 100:.1f}%, "
-                        f"High Volatility / Turbulent: {p_high * 100:.1f}%. Log-space forward recursion "
+                        f"Kelly Multiplier kappa: {kappa_str}). {probs_text} Log-space forward recursion "
                         f"strictly avoids backward Baum-Welch lookahead leaks."
                     )
-                    routed_data = reg
+                    if isinstance(reg, dict):
+                        routed_data = _sanitize_json_obj({**reg, "kappa": kappa, "filtered_probabilities": clean_probs})
+                    else:
+                        routed_data = reg
 
                 # 3. SEC EDGAR / Form 4 / Insider / Cluster
                 elif any(k in q_lower for k in ("insider", "form 4", "cluster", "sec")):
